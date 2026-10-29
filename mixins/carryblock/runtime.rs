@@ -10,7 +10,7 @@
 // the running game.
 
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 /// A player's UUID as the game keeps it.
 pub type Uuid = [i32; 4];
@@ -18,7 +18,7 @@ pub type Uuid = [i32; 4];
 /// The mod's id: its row in Options > Mods and its settings folder
 /// (`horizon-mods/.horizon-mod-data/carryblock/`).
 pub const ID: &str = "carryblock";
-pub const VERSION: &str = "0.1.0";
+pub const VERSION: &str = "0.1.1";
 pub const DESCRIPTION: &str = "Sneak and right click with an empty hand to pick up a chest, a \
 furnace or a small animal with everything in it; right click a block to put it down.";
 /// The configuration, in the mod's settings folder: what the settings page
@@ -80,6 +80,13 @@ pub const DEFAULT_DENY_BLOCKS: &[&str] = &[
     "minecraft:test_block",
     "minecraft:test_instance_block",
     "minecraft:reinforced_deepslate",
+    // No tool ever gets these in survival, silk touch included: carrying
+    // one would move what vanilla only lets a player destroy (a dungeon's
+    // spawner next to another, a trial chamber's vault).
+    "minecraft:spawner",
+    "minecraft:trial_spawner",
+    "minecraft:vault",
+    "minecraft:budding_amethyst",
 ];
 pub const DEFAULT_DENY_ENTITIES: &[&str] = &[
     "minecraft:player",
@@ -291,10 +298,45 @@ pub enum Refusal {
     Leashed,
     Inventory,
     NotYours,
+    /// A game master block (command, structure, jigsaw, test blocks) and a
+    /// player who may not use them (`Player.canUseGameMasterBlocks`).
+    GameMaster,
+    /// Another player (or this one) has its container open.
+    InUse,
+    /// `Invulnerable`, and a player who is not in creative.
+    Invulnerable,
+    /// It holds other mobs' leads (a wandering trader's llamas).
+    Leading,
+    /// A player is trading with it.
+    Trading,
+    /// It sleeps in a bed.
+    Sleeping,
+    /// Under spawn protection (the game's own red message is shown instead,
+    /// `ServerPlayer.sendSpawnProtectionMessage`).
+    SpawnProtection,
+    /// Outside the world border.
+    Border,
+    /// In an unloaded chunk or above or below the level.
+    OutOfWorld,
+    /// Out of the player's reach.
+    TooFar,
+    /// A player who may not build (adventure mode).
+    CantBuild,
 }
 impl Refusal {
     pub fn message(self) -> &'static str {
         match self {
+            Self::GameMaster => "Only operators in creative can move that",
+            Self::InUse => "Someone is using that",
+            Self::Invulnerable => "That can't be carried",
+            Self::Leading => "Unleash what it leads first",
+            Self::Trading => "Someone is trading with it",
+            Self::Sleeping => "Let it sleep",
+            Self::SpawnProtection => "That's under spawn protection",
+            Self::Border => "That's outside the world border",
+            Self::OutOfWorld => "That's outside the world",
+            Self::TooFar => "That's too far away",
+            Self::CantBuild => "You can't build here",
             Self::Denied => "That can't be carried",
             Self::Unbreakable => "That can't be moved",
             Self::TwoBlocks => "Only single blocks can be carried",
@@ -327,6 +369,182 @@ fn ignores_rules(config: &Config, mode: Mode) -> bool {
     mode == Mode::Creative && config.creative_ignores_rules
 }
 
+/// `Abilities.mayBuild`: survival and creative players build, adventure and
+/// spectator players don't. Carry Block never has an item in the hand, so an
+/// adventure player's `CanBreak`/`CanPlaceOn` (`Player.blockActionRestricted`,
+/// `ItemStack.useOn`) never lets them either.
+pub fn may_build(mode: Mode) -> bool {
+    matches!(mode, Mode::Survival | Mode::Creative)
+}
+
+/// The game master blocks (vanilla's `GameMasterBlock` blocks: `CommandBlock`,
+/// `StructureBlock`, `JigsawBlock`, `TestBlock`, `TestInstanceBlock`), by id
+/// and by class for subclasses: only a player who may use them
+/// (`Player.canUseGameMasterBlocks`: creative, permission level 2) breaks
+/// (`ServerPlayerGameMode.destroyBlock`) or places one.
+pub const GAME_MASTER_BLOCKS: &[&str] = &[
+    "minecraft:command_block",
+    "minecraft:chain_command_block",
+    "minecraft:repeating_command_block",
+    "minecraft:structure_block",
+    "minecraft:jigsaw",
+    "minecraft:test_block",
+    "minecraft:test_instance_block",
+];
+pub const GAME_MASTER_CLASSES: &[&str] = &[
+    "CommandBlock",
+    "StructureBlock",
+    "JigsawBlock",
+    "TestBlock",
+    "TestInstanceBlock",
+];
+pub fn is_game_master_block(name: &str, has_class: &dyn Fn(&str) -> bool) -> bool {
+    GAME_MASTER_BLOCKS.contains(&namespaced(name).as_str())
+        || GAME_MASTER_CLASSES.iter().any(|c| has_class(c))
+}
+
+/// `server.properties`' `spawn-protection` and `ops.json`, as the server
+/// last said.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SpawnRules {
+    /// The radius around the world spawn (`spawn-protection`).
+    pub radius: i32,
+    /// The operators' UUIDs.
+    pub ops: BTreeSet<u128>,
+    /// Read from the server at least once: until it is, a dedicated
+    /// server's player is under protection everywhere near (fails closed).
+    pub known: bool,
+}
+
+/// `DedicatedServer.isUnderSpawnProtection` (and Horizon's
+/// `under_spawn_protection`): whether `player` may not change the block at
+/// `pos` because of spawn protection. `spawn` is the world spawn when the
+/// block is in the world spawn's level (the Overworld), else None. Only a
+/// dedicated server protects its spawn (an integrated one, single player and
+/// LAN, never does: `MinecraftServer.isUnderSpawnProtection`); `player` is
+/// None for single player's own player. No operators at all, an operator, or
+/// a radius of 0 or less: not protected.
+pub fn under_spawn_protection(
+    rules: &SpawnRules,
+    dedicated: bool,
+    player: Option<u128>,
+    spawn: Option<[i32; 3]>,
+    pos: [i32; 3],
+) -> bool {
+    let (true, Some(player), Some(spawn)) = (dedicated, player, spawn) else {
+        return false;
+    };
+    if !rules.known {
+        return true;
+    }
+    if rules.ops.is_empty() || rules.ops.contains(&player) || rules.radius <= 0 {
+        return false;
+    }
+    let distance = pos[0].abs_diff(spawn[0]).max(pos[2].abs_diff(spawn[2]));
+    distance <= rules.radius.unsigned_abs()
+}
+
+/// `Player.isWithinBlockInteractionRange(pos, buffer)` as
+/// `range + buffer`: `eye` closer than `range` to the box of the block at
+/// `pos` (`AABB.distanceToSqr`).
+pub fn within_block_range(eye: [f64; 3], range: f64, pos: [i32; 3]) -> bool {
+    (0..3)
+        .map(|k| {
+            let lo = f64::from(pos[k]);
+            (lo - eye[k]).max(eye[k] - lo - 1.0).max(0.0).powi(2)
+        })
+        .sum::<f64>()
+        < range * range
+}
+
+/// A block a player changes, as the game checks it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Spot {
+    /// In a loaded chunk, within the level's height.
+    pub in_world: bool,
+    /// Within the player's reach (`isWithinBlockInteractionRange(pos, 1.0)`).
+    pub reachable: bool,
+    /// Under spawn protection for this player ([`under_spawn_protection`]).
+    pub spawn_protected: bool,
+    /// Inside the world border (`WorldBorder.isWithinBounds`).
+    pub inside_border: bool,
+}
+
+/// `ServerLevel.mayInteract`: not under spawn protection, inside the world
+/// border.
+fn may_interact(at: Spot) -> Result<(), Refusal> {
+    if at.spawn_protected {
+        return Err(Refusal::SpawnProtection);
+    }
+    if !at.inside_border {
+        return Err(Refusal::Border);
+    }
+    Ok(())
+}
+
+/// Picking a block up is breaking it: `ServerPlayerGameMode.handleBlockBreakAction`
+/// (in the level, within reach, spawn protection, `mayInteract`) and
+/// `destroyBlock` (`blockActionRestricted`: a player who may build).
+pub fn may_break(mode: Mode, at: Spot) -> Result<(), Refusal> {
+    if !at.in_world {
+        return Err(Refusal::OutOfWorld);
+    }
+    if !at.reachable {
+        return Err(Refusal::TooFar);
+    }
+    may_interact(at)?;
+    if !may_build(mode) {
+        return Err(Refusal::CantBuild);
+    }
+    Ok(())
+}
+
+/// Putting down starts as using the clicked block:
+/// `ServerGamePacketListenerImpl.handleUseItemOn` (within reach, spawn
+/// protection, `mayInteract`) and a player who may build (`ItemStack.useOn`).
+pub fn may_use_on(mode: Mode, clicked: Spot) -> Result<(), Refusal> {
+    if !clicked.reachable {
+        return Err(Refusal::TooFar);
+    }
+    may_interact(clicked)?;
+    if !may_build(mode) {
+        return Err(Refusal::CantBuild);
+    }
+    Ok(())
+}
+
+/// Putting a block (or a mob) down is placing it at `target`: the clicked
+/// block as [`may_use_on`], and the block it goes into inside the world, not
+/// under spawn protection and inside the world border (stricter than
+/// vanilla, which only checks the clicked block: the protected area's edge is
+/// not one block wider for Carry Block).
+pub fn may_place(mode: Mode, clicked: Spot, target: Spot) -> Result<(), Refusal> {
+    may_use_on(mode, clicked)?;
+    if !target.in_world {
+        return Err(Refusal::OutOfWorld);
+    }
+    may_interact(target)
+}
+
+/// Picking a mob up, at the block it stands in: in the level,
+/// `ServerGamePacketListenerImpl.handleInteract`'s world border, and spawn
+/// protection (stricter than vanilla, which lets anyone use a mob at spawn:
+/// taking one away is more than using it). Reach is the mob ray's own (3
+/// blocks, 5 in creative).
+pub fn may_take_mob(at: Spot) -> Result<(), Refusal> {
+    if !at.in_world {
+        return Err(Refusal::OutOfWorld);
+    }
+    may_interact(at)
+}
+
+/// Whether a dead carrier's block may be left at `at` (else it is dropped
+/// as its item, as a dead player's inventory is): in the world, not under
+/// their spawn protection, inside the world border.
+pub fn may_release_at(at: Spot) -> bool {
+    at.in_world && may_interact(at).is_ok()
+}
+
 /// A block as the game describes it.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct BlockInfo {
@@ -342,6 +560,10 @@ pub struct BlockInfo {
     pub empty: bool,
     /// Its block entity has a lock (`lock`).
     pub locked: bool,
+    /// A game master block ([`is_game_master_block`]).
+    pub game_master: bool,
+    /// A player has its container open (a menu over its block entity).
+    pub in_use: bool,
 }
 
 /// Half of a block that is two blocks (beds, doors, tall plants), or an
@@ -356,10 +578,12 @@ pub fn is_two_blocks(properties: &BTreeMap<String, String>) -> bool {
 }
 
 /// Whether `block` may be picked up. `in_tag` answers block tags for the
-/// deny list.
+/// deny list; `game_master` is whether the player may use game master
+/// blocks. Where it is and who may change it there is [`may_break`]'s.
 pub fn block_verdict(
     config: &Config,
     mode: Mode,
+    game_master: bool,
     block: &BlockInfo,
     in_tag: &dyn Fn(&str) -> bool,
 ) -> Verdict {
@@ -370,6 +594,13 @@ pub fn block_verdict(
         BlockRule::Off => return Verdict::Pass,
         BlockRule::WithData if !block.block_entity => return Verdict::Pass,
         BlockRule::WithData | BlockRule::Any => {}
+    }
+    // Permissions and the world's consistency first: no setting lifts them.
+    if block.game_master && !game_master {
+        return Verdict::Refuse(Refusal::GameMaster);
+    }
+    if block.in_use {
+        return Verdict::Refuse(Refusal::InUse);
     }
     let bypass = ignores_rules(config, mode);
     if !bypass && denied(&config.deny_blocks, &block.name, in_tag) {
@@ -408,6 +639,15 @@ pub struct MobInfo {
     pub inventory: bool,
     /// Tamed by another player.
     pub owned_by_other: bool,
+    /// `Invulnerable` (map makers' mobs): only a creative player can hurt it
+    /// (`Entity.isInvulnerableToBase`), so only one can take it away.
+    pub invulnerable: bool,
+    /// It holds other mobs' leads: they would be left tied to nothing.
+    pub leading: bool,
+    /// A player is trading with it (its offers are written back on close).
+    pub trading: bool,
+    /// It sleeps in a bed, which would stay occupied.
+    pub sleeping: bool,
 }
 
 pub fn mob_verdict(config: &Config, mode: Mode, mob: &MobInfo) -> Verdict {
@@ -437,6 +677,18 @@ pub fn mob_verdict(config: &Config, mode: Mode, mob: &MobInfo) -> Verdict {
     }
     if mob.owned_by_other {
         return Verdict::Refuse(Refusal::NotYours);
+    }
+    if mob.invulnerable && mode != Mode::Creative {
+        return Verdict::Refuse(Refusal::Invulnerable);
+    }
+    if mob.leading {
+        return Verdict::Refuse(Refusal::Leading);
+    }
+    if mob.trading {
+        return Verdict::Refuse(Refusal::Trading);
+    }
+    if mob.sleeping {
+        return Verdict::Refuse(Refusal::Sleeping);
     }
     Verdict::Allow
 }
@@ -510,6 +762,11 @@ pub const PLACEMENT_KEYS: &[&str] = &[
     "powered",
     "triggered",
     "enabled",
+    // A natural sculk shrieker summons wardens and a natural creaking heart
+    // spawns a creaking; placed ones (silk touch's) don't. Put down, one is
+    // a placed one, as vanilla's only way to move it gives.
+    "can_summon",
+    "natural",
 ];
 
 /// The state to put a carried block down with: `placed` (what placing its
@@ -528,14 +785,16 @@ pub fn placed_state(carried: &State, placed: &State) -> State {
 }
 
 /// The state to leave a carried block in where its carrier died: as carried,
-/// alone (no chest half), closed, and holding water when it is put in water.
+/// alone (no chest half), closed, placed (a shrieker that summons nothing, a
+/// creaking heart that is not natural) and holding water when it is put in
+/// water.
 pub fn released_state(carried: &State, water: bool) -> State {
     let mut state = carried.clone();
     let p = &mut state.properties;
     if p.get("type").is_some_and(|t| t == "left" || t == "right") {
         p.insert("type".into(), "single".into());
     }
-    for key in ["open", "powered"] {
+    for key in ["open", "powered", "can_summon", "natural"] {
         if p.contains_key(key) {
             p.insert(key.into(), "false".into());
         }
@@ -882,6 +1141,7 @@ mod tests {
             item: Some("minecraft:chest".into()),
             empty: false,
             locked: false,
+            ..BlockInfo::default()
         }
     }
     fn dirt() -> BlockInfo {
@@ -905,6 +1165,13 @@ mod tests {
     fn no_tags(_: &str) -> bool {
         false
     }
+    /// Anywhere a player may change a block.
+    const FREE: Spot = Spot {
+        in_world: true,
+        reachable: true,
+        spawn_protected: false,
+        inside_border: true,
+    };
 
     #[test]
     fn default_config_is_valid_and_round_trips() {
@@ -974,11 +1241,11 @@ mod tests {
     fn blocks_with_data_by_default() {
         let c = Config::default();
         assert_eq!(
-            block_verdict(&c, Mode::Survival, &chest(), &no_tags),
+            block_verdict(&c, Mode::Survival, false, &chest(), &no_tags),
             Verdict::Allow
         );
         assert_eq!(
-            block_verdict(&c, Mode::Survival, &dirt(), &no_tags),
+            block_verdict(&c, Mode::Survival, false, &dirt(), &no_tags),
             Verdict::Pass
         );
         let any = Config {
@@ -986,7 +1253,7 @@ mod tests {
             ..Config::default()
         };
         assert_eq!(
-            block_verdict(&any, Mode::Survival, &dirt(), &no_tags),
+            block_verdict(&any, Mode::Survival, false, &dirt(), &no_tags),
             Verdict::Allow
         );
         let none = Config {
@@ -994,7 +1261,7 @@ mod tests {
             ..Config::default()
         };
         assert_eq!(
-            block_verdict(&none, Mode::Survival, &chest(), &no_tags),
+            block_verdict(&none, Mode::Survival, false, &chest(), &no_tags),
             Verdict::Pass
         );
         let air = BlockInfo {
@@ -1002,7 +1269,7 @@ mod tests {
             ..chest()
         };
         assert_eq!(
-            block_verdict(&any, Mode::Survival, &air, &no_tags),
+            block_verdict(&any, Mode::Survival, false, &air, &no_tags),
             Verdict::Pass
         );
     }
@@ -1018,7 +1285,7 @@ mod tests {
             ..BlockInfo::default()
         };
         assert_eq!(
-            block_verdict(&c, Mode::Survival, &portal, &no_tags),
+            block_verdict(&c, Mode::Survival, false, &portal, &no_tags),
             Verdict::Refuse(Refusal::Denied)
         );
         let bypass = Config {
@@ -1027,7 +1294,7 @@ mod tests {
         };
         // Even ignoring the lists, a block without an item stays put.
         assert_eq!(
-            block_verdict(&bypass, Mode::Creative, &portal, &no_tags),
+            block_verdict(&bypass, Mode::Creative, false, &portal, &no_tags),
             Verdict::Refuse(Refusal::NoItem)
         );
         let bed = BlockInfo {
@@ -1037,7 +1304,7 @@ mod tests {
             ..chest()
         };
         assert_eq!(
-            block_verdict(&c, Mode::Creative, &bed, &no_tags),
+            block_verdict(&c, Mode::Creative, false, &bed, &no_tags),
             Verdict::Refuse(Refusal::TwoBlocks)
         );
         let any = Config {
@@ -1050,7 +1317,7 @@ mod tests {
             ..dirt()
         };
         assert_eq!(
-            block_verdict(&any, Mode::Survival, &door, &no_tags),
+            block_verdict(&any, Mode::Survival, false, &door, &no_tags),
             Verdict::Refuse(Refusal::TwoBlocks)
         );
         let stairs = BlockInfo {
@@ -1059,7 +1326,7 @@ mod tests {
             ..dirt()
         };
         assert_eq!(
-            block_verdict(&any, Mode::Survival, &stairs, &no_tags),
+            block_verdict(&any, Mode::Survival, false, &stairs, &no_tags),
             Verdict::Allow
         );
         let unbreakable = BlockInfo {
@@ -1068,11 +1335,11 @@ mod tests {
             ..chest()
         };
         assert_eq!(
-            block_verdict(&c, Mode::Survival, &unbreakable, &no_tags),
+            block_verdict(&c, Mode::Survival, false, &unbreakable, &no_tags),
             Verdict::Refuse(Refusal::Unbreakable)
         );
         assert_eq!(
-            block_verdict(&c, Mode::Creative, &unbreakable, &no_tags),
+            block_verdict(&c, Mode::Creative, false, &unbreakable, &no_tags),
             Verdict::Allow
         );
         let locked = BlockInfo {
@@ -1080,7 +1347,7 @@ mod tests {
             ..chest()
         };
         assert_eq!(
-            block_verdict(&c, Mode::Creative, &locked, &no_tags),
+            block_verdict(&c, Mode::Creative, false, &locked, &no_tags),
             Verdict::Refuse(Refusal::Locked)
         );
         let bedrock = BlockInfo {
@@ -1090,7 +1357,7 @@ mod tests {
             ..dirt()
         };
         assert_eq!(
-            block_verdict(&any, Mode::Creative, &bedrock, &no_tags),
+            block_verdict(&any, Mode::Creative, false, &bedrock, &no_tags),
             Verdict::Refuse(Refusal::Denied)
         );
         let any_bypass = Config {
@@ -1098,11 +1365,11 @@ mod tests {
             ..any
         };
         assert_eq!(
-            block_verdict(&any_bypass, Mode::Creative, &bedrock, &no_tags),
+            block_verdict(&any_bypass, Mode::Creative, false, &bedrock, &no_tags),
             Verdict::Allow
         );
         assert_eq!(
-            block_verdict(&any_bypass, Mode::Survival, &bedrock, &no_tags),
+            block_verdict(&any_bypass, Mode::Survival, false, &bedrock, &no_tags),
             Verdict::Refuse(Refusal::Denied)
         );
     }
@@ -1431,5 +1698,398 @@ mod tests {
         assert!(labels[0].contains("..."));
         assert_eq!(click(&loaded, 0), Some(Effect::Reload));
         assert_eq!(click(&loaded, 1), Some(Effect::Save(Config::default())));
+    }
+
+    fn mode_and_spot_cases() -> Vec<(Mode, Spot, Result<(), Refusal>)> {
+        let free = FREE;
+        vec![
+            (Mode::Survival, free, Ok(())),
+            (Mode::Creative, free, Ok(())),
+            (Mode::Adventure, free, Err(Refusal::CantBuild)),
+            (Mode::Spectator, free, Err(Refusal::CantBuild)),
+            (
+                Mode::Creative,
+                Spot {
+                    spawn_protected: true,
+                    ..free
+                },
+                Err(Refusal::SpawnProtection),
+            ),
+            (
+                Mode::Creative,
+                Spot {
+                    inside_border: false,
+                    ..free
+                },
+                Err(Refusal::Border),
+            ),
+            (
+                Mode::Survival,
+                Spot {
+                    reachable: false,
+                    ..free
+                },
+                Err(Refusal::TooFar),
+            ),
+            // Spawn protection is told before the border, as the game does.
+            (
+                Mode::Survival,
+                Spot {
+                    spawn_protected: true,
+                    inside_border: false,
+                    ..free
+                },
+                Err(Refusal::SpawnProtection),
+            ),
+        ]
+    }
+
+    #[test]
+    fn picking_up_a_block_is_breaking_it() {
+        for (mode, spot, expected) in mode_and_spot_cases() {
+            assert_eq!(may_break(mode, spot), expected, "{mode:?} {spot:?}");
+        }
+        let unloaded = Spot {
+            in_world: false,
+            ..FREE
+        };
+        assert_eq!(
+            may_break(Mode::Creative, unloaded),
+            Err(Refusal::OutOfWorld)
+        );
+        assert!(may_build(Mode::Survival) && may_build(Mode::Creative));
+        assert!(!may_build(Mode::Adventure) && !may_build(Mode::Spectator));
+    }
+
+    #[test]
+    fn putting_down_is_placing_at_the_target() {
+        let free = FREE;
+        for (mode, clicked, expected) in mode_and_spot_cases() {
+            assert_eq!(may_use_on(mode, clicked), expected, "{mode:?} {clicked:?}");
+            assert_eq!(may_place(mode, clicked, free), expected);
+        }
+        // The clicked block is fine, the block it goes into is not.
+        for (target, refusal) in [
+            (
+                Spot {
+                    spawn_protected: true,
+                    ..free
+                },
+                Refusal::SpawnProtection,
+            ),
+            (
+                Spot {
+                    inside_border: false,
+                    ..free
+                },
+                Refusal::Border,
+            ),
+            (
+                Spot {
+                    in_world: false,
+                    ..free
+                },
+                Refusal::OutOfWorld,
+            ),
+        ] {
+            assert_eq!(may_place(Mode::Survival, free, target), Err(refusal));
+        }
+        // Only the clicked block needs to be in reach (vanilla).
+        let far = Spot {
+            reachable: false,
+            ..free
+        };
+        assert_eq!(may_place(Mode::Survival, free, far), Ok(()));
+        assert_eq!(may_place(Mode::Survival, far, free), Err(Refusal::TooFar));
+        // Adventure: nothing is put down, even somewhere free.
+        assert_eq!(
+            may_place(Mode::Adventure, free, free),
+            Err(Refusal::CantBuild)
+        );
+    }
+
+    #[test]
+    fn taking_a_mob_and_releasing_a_load() {
+        let free = FREE;
+        assert_eq!(may_take_mob(free), Ok(()));
+        // Reach is the mob ray's: an unreachable flag does not matter.
+        assert_eq!(
+            may_take_mob(Spot {
+                reachable: false,
+                ..free
+            }),
+            Ok(())
+        );
+        for (spot, refusal) in [
+            (
+                Spot {
+                    spawn_protected: true,
+                    ..free
+                },
+                Refusal::SpawnProtection,
+            ),
+            (
+                Spot {
+                    inside_border: false,
+                    ..free
+                },
+                Refusal::Border,
+            ),
+            (
+                Spot {
+                    in_world: false,
+                    ..free
+                },
+                Refusal::OutOfWorld,
+            ),
+        ] {
+            assert_eq!(may_take_mob(spot), Err(refusal));
+            assert!(!may_release_at(spot));
+        }
+        assert!(may_release_at(free));
+    }
+
+    #[test]
+    fn spawn_protection_as_a_dedicated_server_has_it() {
+        let me = 7u128;
+        let rules = SpawnRules {
+            radius: 16,
+            ops: [1u128].into_iter().collect(),
+            known: true,
+        };
+        let spawn = Some([100, 64, -50]);
+        let at = [100, 64, -50];
+        // Within the square of the radius (inclusive), at any height.
+        assert!(under_spawn_protection(&rules, true, Some(me), spawn, at));
+        for pos in [[116, -60, -34], [84, 300, -66]] {
+            assert!(under_spawn_protection(&rules, true, Some(me), spawn, pos));
+        }
+        for pos in [[117, 64, -50], [100, 64, -67]] {
+            assert!(!under_spawn_protection(&rules, true, Some(me), spawn, pos));
+        }
+        // An operator is exempt.
+        assert!(!under_spawn_protection(&rules, true, Some(1), spawn, at));
+        // Single player and LAN (an integrated server), and single player's
+        // own player, never are.
+        assert!(!under_spawn_protection(&rules, false, Some(me), spawn, at));
+        assert!(!under_spawn_protection(&rules, true, None, spawn, at));
+        // Not the world spawn's level (the Nether, the End).
+        assert!(!under_spawn_protection(&rules, true, Some(me), None, at));
+        // No operators at all, or a radius of 0 or less: nobody is.
+        let no_ops = SpawnRules {
+            ops: BTreeSet::new(),
+            ..rules.clone()
+        };
+        assert!(!under_spawn_protection(&no_ops, true, Some(me), spawn, at));
+        for radius in [0, -3] {
+            let off = SpawnRules {
+                radius,
+                ..rules.clone()
+            };
+            assert!(!under_spawn_protection(&off, true, Some(me), spawn, at));
+        }
+        // Before the server said anything, a dedicated server's player is
+        // protected (it fails closed); single player still is not.
+        let unknown = SpawnRules::default();
+        let far = [5000, 64, 5000];
+        assert!(under_spawn_protection(&unknown, true, Some(me), spawn, far));
+        assert!(!under_spawn_protection(
+            &unknown,
+            false,
+            Some(me),
+            spawn,
+            at
+        ));
+        // Far coordinates don't overflow.
+        let edge = [i32::MIN, 0, i32::MAX];
+        assert!(!under_spawn_protection(&rules, true, Some(me), spawn, edge));
+    }
+
+    #[test]
+    fn block_interaction_range() {
+        let eye = [0.5, 1.62, 0.5];
+        // 4.5 + 1 in survival, to the box of the block, not its centre.
+        assert!(within_block_range(eye, 5.5, [5, 1, 0]));
+        assert!(!within_block_range(eye, 5.5, [6, 1, 0]));
+        assert!(within_block_range(eye, 5.5, [0, 0, 0]));
+        assert!(within_block_range(eye, 6.0, [-6, 1, 0]));
+        assert!(!within_block_range(eye, 6.0, [-7, 1, 0]));
+        assert!(!within_block_range(eye, 5.5, [4, 5, 4]));
+    }
+
+    #[test]
+    fn game_master_blocks_and_open_containers() {
+        let c = Config::default();
+        assert!(is_game_master_block("minecraft:command_block", &|_| false));
+        assert!(is_game_master_block("jigsaw", &|_| false));
+        assert!(is_game_master_block("mod:better_command_block", &|c| c == "CommandBlock"));
+        assert!(!is_game_master_block("minecraft:chest", &|c| c == "ChestBlock"));
+        let command = BlockInfo {
+            name: "minecraft:command_block".into(),
+            hardness: -1.0,
+            item: Some("minecraft:command_block".into()),
+            game_master: true,
+            ..chest()
+        };
+        let bypass = Config {
+            creative_ignores_rules: true,
+            deny_blocks: Vec::new(),
+            ..Config::default()
+        };
+        // No setting lets a player who may not use them move one.
+        for config in [&c, &bypass] {
+            assert_eq!(
+                block_verdict(config, Mode::Creative, false, &command, &no_tags),
+                Verdict::Refuse(Refusal::GameMaster)
+            );
+        }
+        // An operator in creative may, unless the deny list says no.
+        assert_eq!(
+            block_verdict(&bypass, Mode::Creative, true, &command, &no_tags),
+            Verdict::Allow
+        );
+        assert_eq!(
+            block_verdict(&c, Mode::Creative, true, &command, &no_tags),
+            Verdict::Refuse(Refusal::Denied)
+        );
+        let open = BlockInfo {
+            in_use: true,
+            ..chest()
+        };
+        for (config, mode) in [(&c, Mode::Survival), (&bypass, Mode::Creative)] {
+            assert_eq!(
+                block_verdict(config, mode, true, &open, &no_tags),
+                Verdict::Refuse(Refusal::InUse)
+            );
+        }
+    }
+
+    #[test]
+    fn unobtainable_blocks_are_denied_by_default() {
+        let c = Config::default();
+        for name in [
+            "minecraft:spawner",
+            "minecraft:trial_spawner",
+            "minecraft:vault",
+            "minecraft:end_gateway",
+        ] {
+            let block = BlockInfo {
+                name: name.into(),
+                item: Some(name.into()),
+                ..chest()
+            };
+            assert_eq!(
+                block_verdict(&c, Mode::Survival, false, &block, &no_tags),
+                Verdict::Refuse(Refusal::Denied),
+                "{name}"
+            );
+        }
+        let budding = BlockInfo {
+            name: "minecraft:budding_amethyst".into(),
+            item: Some("minecraft:budding_amethyst".into()),
+            ..dirt()
+        };
+        let any = Config {
+            blocks: BlockRule::Any,
+            ..Config::default()
+        };
+        assert_eq!(
+            block_verdict(&any, Mode::Survival, false, &budding, &no_tags),
+            Verdict::Refuse(Refusal::Denied)
+        );
+        // An end gateway has no item: refused even when the list allows it.
+        let gateway = BlockInfo {
+            name: "minecraft:end_gateway".into(),
+            item: None,
+            ..chest()
+        };
+        let bypass = Config {
+            creative_ignores_rules: true,
+            ..Config::default()
+        };
+        assert_eq!(
+            block_verdict(&bypass, Mode::Creative, false, &gateway, &no_tags),
+            Verdict::Refuse(Refusal::NoItem)
+        );
+    }
+
+    #[test]
+    fn mobs_nobody_could_take() {
+        let bypass = Config {
+            creative_ignores_rules: true,
+            ..Config::default()
+        };
+        for (mob, refusal) in [
+            (
+                MobInfo {
+                    leading: true,
+                    ..pig()
+                },
+                Refusal::Leading,
+            ),
+            (
+                MobInfo {
+                    trading: true,
+                    ..pig()
+                },
+                Refusal::Trading,
+            ),
+            (
+                MobInfo {
+                    sleeping: true,
+                    ..pig()
+                },
+                Refusal::Sleeping,
+            ),
+        ] {
+            for mode in [Mode::Survival, Mode::Creative] {
+                assert_eq!(
+                    mob_verdict(&bypass, mode, &mob),
+                    Verdict::Refuse(refusal),
+                    "{mode:?}"
+                );
+            }
+        }
+        let invulnerable = MobInfo {
+            invulnerable: true,
+            ..pig()
+        };
+        assert_eq!(
+            mob_verdict(&Config::default(), Mode::Survival, &invulnerable),
+            Verdict::Refuse(Refusal::Invulnerable)
+        );
+        assert_eq!(
+            mob_verdict(&Config::default(), Mode::Creative, &invulnerable),
+            Verdict::Allow
+        );
+        for r in [
+            Refusal::GameMaster,
+            Refusal::InUse,
+            Refusal::SpawnProtection,
+            Refusal::Border,
+            Refusal::OutOfWorld,
+            Refusal::TooFar,
+            Refusal::CantBuild,
+        ] {
+            assert!(!r.message().is_empty());
+        }
+    }
+
+    #[test]
+    fn natural_spawners_are_put_down_as_placed_ones() {
+        let shrieker =
+            State::parse("minecraft:sculk_shrieker[can_summon=true,shrieking=false]").unwrap();
+        let placed =
+            State::parse("minecraft:sculk_shrieker[can_summon=false,shrieking=false]").unwrap();
+        assert_eq!(placed_state(&shrieker, &placed), placed);
+        assert_eq!(released_state(&shrieker, false), placed);
+        let heart = State::parse("minecraft:creaking_heart[axis=y,natural=true]").unwrap();
+        let placed = State::parse("minecraft:creaking_heart[axis=x,natural=false]").unwrap();
+        assert_eq!(placed_state(&heart, &placed), placed);
+        let released = released_state(&heart, false);
+        assert_eq!(
+            released.properties.get("natural").map(String::as_str),
+            Some("false")
+        );
     }
 }

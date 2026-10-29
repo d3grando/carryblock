@@ -1,6 +1,6 @@
 [mod]
 id = "carryblock"
-version = "0.1.0"
+version = "0.1.1"
 # Between TreeFall (200) and Mason (300). Mason also hooks Game::use_item, for
 # its wand in creative only (a wooden axe: never an empty hand, so never a
 # pick up); same-site HEAD hooks run by priority, highest first, and the first

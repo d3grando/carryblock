@@ -10,9 +10,17 @@
 // saved, loaded, swapped in for a LAN guest's turn and kept through a
 // disconnect exactly like their inventory. Nothing is ever an item while it
 // is carried.
+//
+// A pick up is checked as the game checks a player breaking that block (a
+// mob: interacting with it), a put down as placing a block where it goes
+// (runtime.rs `may_break`, `may_take_mob`, `may_place`): in the level, within
+// reach, spawn protection, the world border, `mayBuild`, game master blocks.
+// What a guest's turn cannot see of the hub (spawn protection's radius and
+// operators, permission levels, open containers, trades) is read at every
+// tick (`HubView`).
 use super::carryblock::{
-    self as ca, BlockInfo, Command, Config, Effect, HudCorner, Loaded, MobInfo, Mode, State, Uuid,
-    Verdict,
+    self as ca, BlockInfo, Command, Config, Effect, HudCorner, Loaded, MobInfo, Mode, Refusal,
+    SpawnRules, Spot, State, Uuid, Verdict,
 };
 use super::{Dim, Game, GuestUse, Hit};
 use horizon_client::blocks::Fluid;
@@ -24,6 +32,8 @@ use horizon_client::extras_hud::Corners;
 use horizon_client::first_person::Hand;
 use horizon_client::hud::HudBatch;
 use horizon_client::items::ItemStack;
+use horizon_client::lan::menu::Slots;
+use horizon_client::mobs::leash::Holder;
 use horizon_client::text::Text;
 use horizon_core::geometry::{Direction, Vec3};
 use horizon_core::position::BlockPos;
@@ -32,7 +42,7 @@ use horizon_world::level::{LevelEvent, PlaceContext, flags};
 use horizon_world::nbt::{Compound, JavaString, Tag};
 use horizon_world::registry::BlockStateId;
 use std::cell::RefCell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::{Duration, Instant};
@@ -57,11 +67,28 @@ const WINDOW_UNSEEN: u8 = 0;
 const WINDOW_ON: u8 = 1;
 const WINDOW_OFF: u8 = 2;
 
+/// What the hub knows that a LAN guest's own turn cannot see (the hub is out
+/// of `Game::lan` while a guest acts): read at every tick and before the
+/// in-frame player's own click, used by the next guest's.
+#[derive(Default)]
+struct HubView {
+    /// `spawn-protection` and the operators.
+    spawn: SpawnRules,
+    /// Each player's permission level (`Player.canUseGameMasterBlocks`).
+    permissions: HashMap<u128, u8>,
+    /// The blocks whose container a player has open, by level.
+    open: HashSet<(&'static str, (i32, i32, i32))>,
+    /// The mobs a player trades with, by level.
+    trading: HashSet<(&'static str, u32)>,
+}
+
 thread_local! {
     /// Each player's last use, on the thread of the game that simulates
     /// the world (a held use button must not flip between pick up and put
     /// down).
     static CLICKS: RefCell<ca::Clicks> = RefCell::new(ca::Clicks::default());
+    /// The hub as last read, on the same thread.
+    static HUB: RefCell<HubView> = RefCell::new(HubView::default());
 }
 
 /// Never held while the game runs.
@@ -243,7 +270,9 @@ impl Game<'_> {
     /// A line in the acting player's action bar: a guest gets it at the
     /// end of their turn.
     fn ca_tell(&mut self, text: &str) {
-        let line = Text::literal(text.to_owned());
+        self.ca_say(Text::literal(text.to_owned()));
+    }
+    fn ca_say(&mut self, line: Text) {
         if self.lan_acting.is_some() {
             self.guest_packets.push(C::SystemChat(play::SystemChat {
                 content: horizon_client::lan::data::component_nbt(&line.component()),
@@ -265,6 +294,112 @@ impl Game<'_> {
                 .get(*t)
                 .is_some_and(|set| set.contains(name) || set.contains(short_name))
         })
+    }
+
+    /// Keeps what a guest's turn needs from the hub ([`HubView`]): read when
+    /// the hub is in place (never during a guest's turn), with the in-frame
+    /// player's own open container and trade.
+    fn ca_read_hub(&self) {
+        if self.lan_acting.is_some() {
+            return;
+        }
+        let mut view = HubView::default();
+        if let Some(host) = self.lan.as_ref() {
+            view.spawn = SpawnRules {
+                radius: host.hub.spawn_protection,
+                ops: host.hub.ops.keys().copied().collect(),
+                known: true,
+            };
+            for g in &host.hub.guests {
+                view.permissions.insert(g.uuid, g.permission);
+                let level = Dim::from_id(&g.dimension).id();
+                if let Some(menu) = &g.menu {
+                    let halves = match menu.slots {
+                        Slots::Block(k) => vec![k],
+                        Slots::Double(a, b) => vec![a, b],
+                        Slots::Ender => Vec::new(),
+                    };
+                    for k in menu.pos.into_iter().chain(halves) {
+                        view.open.insert((level, k));
+                    }
+                }
+                let trading = host
+                    .play
+                    .get(&g.conn)
+                    .and_then(|p| p.merchant.as_ref())
+                    .and_then(|m| m.merchant.mob);
+                if let Some(mob) = trading {
+                    view.trading.insert((level, mob));
+                }
+            }
+        }
+        if self.player.is_some() {
+            let level = self.dim.id();
+            for (k, _) in self.container_parts() {
+                view.open.insert((level, k));
+            }
+            if let Some(k) = self.container {
+                view.open.insert((level, k));
+            }
+            let trading = self
+                .station
+                .as_ref()
+                .and_then(|s| s.merchant.as_ref())
+                .and_then(|m| m.mob);
+            if let Some(mob) = trading {
+                view.trading.insert((level, mob));
+            }
+        }
+        HUB.with(|h| *h.borrow_mut() = view);
+    }
+    /// `Player.canUseGameMasterBlocks` for the player acting: creative with
+    /// permission level 2. A guest's level is the hub's: the game's own is
+    /// the host's during a guest's turn.
+    fn ca_game_master(&self) -> bool {
+        let permission = match self.lan_acting_uuid {
+            Some(uuid) => HUB.with(|h| h.borrow().permissions.get(&uuid).copied().unwrap_or(0)),
+            None => self.ui.registries.permission,
+        };
+        self.creative && permission >= 2
+    }
+    /// [`ca::under_spawn_protection`] for `who` (a guest's UUID, None for
+    /// single player's own player) at `pos` in this level: Horizon's
+    /// `under_spawn_protection` (game/lan_actions.rs), the world spawn's
+    /// level being the Overworld.
+    fn ca_spawn_protected(&self, who: Option<u128>, pos: [i32; 3]) -> bool {
+        let spawn = if self.dim == Dim::Overworld {
+            self.level.world_spawn
+        } else {
+            None
+        };
+        let dedicated = self.options.dedicated.is_some();
+        HUB.with(|h| ca::under_spawn_protection(&h.borrow().spawn, dedicated, who, spawn, pos))
+    }
+    /// What the game checks before `who`, the player acting, changes the
+    /// block at `pos`: in the level, within reach of their eyes
+    /// (`isWithinBlockInteractionRange(pos, 1.0)`, as `may_reach_block`),
+    /// spawn protection, the world border (as `lan_guest_packet` checks it).
+    fn ca_spot(&self, who: Option<u128>, pos: [i32; 3]) -> Spot {
+        Spot {
+            in_world: self.ca_in_world(pos),
+            reachable: self
+                .eye_position()
+                .is_some_and(|eye| ca::within_block_range(eye, self.reach() + 1.0, pos)),
+            spawn_protected: self.ca_spawn_protected(who, pos),
+            inside_border: self.border.contains(f64::from(pos[0]), f64::from(pos[2])),
+        }
+    }
+    /// Says why not; under spawn protection with the game's own red line
+    /// (`ServerPlayer.sendSpawnProtectionMessage`).
+    fn ca_refuse(&mut self, why: Refusal, at: [i32; 3]) {
+        if why == Refusal::SpawnProtection {
+            let place = Text::literal(format!("{}, {}, {}", at[0], at[1], at[2]));
+            let line = Text::translate("build.spawn_protection", &[place])
+                .with_color(horizon_client::text::RED);
+            self.ca_say(line);
+        } else {
+            self.ca_tell(why.message());
+        }
     }
 
     /// The block entity at `key` as the game saves it (with its custom
@@ -398,6 +533,11 @@ impl Game<'_> {
         if self.lan_acting.is_none() && !self.native_window() {
             return None;
         }
+        // The in-frame player's own click, the hub in place: read it now (a
+        // guest's turn uses what the last tick read).
+        if self.lan_acting.is_none() && self.lan.is_some() {
+            self.ca_read_hub();
+        }
         let carried = carried_in(self.level.player_extra.as_ref()).cloned();
         let who = self.acting_player_uuid();
         let now = self.ticks;
@@ -462,6 +602,7 @@ impl Game<'_> {
         let facts = self.res.facts().get(state).clone();
         let name = facts.name.to_string();
         let data = self.ca_block_entity_tag(key, &name);
+        let in_use = HUB.with(|h| h.borrow().open.contains(&(self.dim.id(), key)));
         let info = BlockInfo {
             name: name.clone(),
             properties: self
@@ -480,10 +621,14 @@ impl Game<'_> {
                     "minecraft:water" | "minecraft:lava" | "minecraft:bubble_column"
                 ),
             locked: data.as_ref().is_some_and(is_locked),
+            game_master: ca::is_game_master_block(&name, &|class| facts.has_class(class)),
+            in_use,
         };
         let mode = self.ca_mode();
-        let verdict =
-            ca::block_verdict(config, mode, &info, &|tag| self.ca_block_in_tag(tag, &name));
+        let game_master = self.ca_game_master();
+        let verdict = ca::block_verdict(config, mode, game_master, &info, &|tag| {
+            self.ca_block_in_tag(tag, &name)
+        });
         match verdict {
             Verdict::Allow => {}
             Verdict::Pass => return false,
@@ -491,6 +636,12 @@ impl Game<'_> {
                 self.ca_tell(why.message());
                 return false;
             }
+        }
+        // Picking up is breaking it: who may break this block, here.
+        let who = self.lan_acting_uuid;
+        if let Err(why) = ca::may_break(mode, self.ca_spot(who, pos)) {
+            self.ca_refuse(why, pos);
+            return false;
         }
         let state_text = self.state_string(state);
         let after = if facts.waterlogged {
@@ -559,7 +710,13 @@ impl Game<'_> {
         }
         let me = self.acting_player_uuid();
         let mode = self.ca_mode();
+        let level = self.dim.id();
         let m = &self.mobs[index];
+        let at = [
+            m.position.x.floor() as i32,
+            m.position.y.floor() as i32,
+            m.position.z.floor() as i32,
+        ];
         let info = MobInfo {
             id: m.kind.id.clone(),
             width: m.width(),
@@ -569,13 +726,19 @@ impl Game<'_> {
             removed: m.removed,
             riding: m.extra.mount.is_some() || self.riding == Some(m.id),
             ridden: m.extra.rider.is_some() || m.rider.is_some() || m.extra.jockey,
-            leashed: m.leash.is_some() || m.leash_pending.is_some(),
+            leashed: m.extra.leash.is_some() || m.extra.leash_pending.is_some(),
             inventory: m.extra.chested
                 || m.extra.saddled
                 || m.extra.saddle_stack.is_some()
                 || !m.extra.inventory.is_empty(),
             owned_by_other: m.extra.owner.is_some()
                 && !horizon_client::mobs::tame::owned_by(m.extra.owner, me),
+            invulnerable: m.invulnerable_flag,
+            leading: self.mobs.iter().any(|n| {
+                !n.removed && matches!(n.extra.leash, Some(Holder::Mob(holder)) if holder == m.id)
+            }),
+            trading: HUB.with(|h| h.borrow().trading.contains(&(level, m.id))),
+            sleeping: horizon_client::mobs::villager::sleeping(m),
         };
         let name = match &m.custom_name {
             Some(custom) => format!("{custom} ({})", ca::display_name(&m.kind.id)),
@@ -588,6 +751,12 @@ impl Game<'_> {
                 self.ca_tell(why.message());
                 return false;
             }
+        }
+        // `handleInteract`'s world border, and spawn protection, where it is.
+        let who = self.lan_acting_uuid;
+        if let Err(why) = ca::may_take_mob(self.ca_spot(who, at)) {
+            self.ca_refuse(why, at);
+            return false;
         }
         let entity = self.mob_tree_nbt(index);
         // `remove`: gone without dying (no drops, no experience).
@@ -620,8 +789,13 @@ impl Game<'_> {
     /// rules: room, survival, what is in the way, which way it faces), with
     /// its own properties and block entity.
     fn ca_put_block(&mut self, carried: &Tag, hit: &Hit) -> bool {
-        if !self.may_build() {
-            self.ca_tell("You can't build here");
+        // Putting down is placing: using the clicked block, then the block
+        // it goes into.
+        let mode = self.ca_mode();
+        let who = self.lan_acting_uuid;
+        let clicked = self.ca_spot(who, hit.pos);
+        if let Err(why) = ca::may_use_on(mode, clicked) {
+            self.ca_refuse(why, hit.pos);
             return false;
         }
         let registry = self.pack.assets.registry;
@@ -650,7 +824,7 @@ impl Game<'_> {
             pitch: self.pitch,
             sneaking: self.ca_sneaking(),
             item,
-            can_use_game_master_blocks: self.can_use_game_master_blocks(),
+            can_use_game_master_blocks: self.ca_game_master(),
         };
         let Some((at, placed)) =
             self.with_level(|b, level, ticks| b.placement_state(level, ticks, &ctx))
@@ -658,6 +832,11 @@ impl Game<'_> {
             self.ca_tell("There's no room to put it down there");
             return false;
         };
+        let target = [at.x, at.y, at.z];
+        if let Err(why) = ca::may_place(mode, clicked, self.ca_spot(who, target)) {
+            self.ca_refuse(why, target);
+            return false;
+        }
         let placed_text = self.state_string(placed);
         let state: BlockStateId = State::parse(&placed_text)
             .map(|p| ca::placed_state(&carried_state, &p).text())
@@ -674,7 +853,6 @@ impl Game<'_> {
         // The block is in the world: from here on it is not carried any
         // more, whatever happens to it next.
         put_carried(&mut self.level.player_extra, None);
-        let target = [at.x, at.y, at.z];
         let now = self.world.block(target[0], target[1], target[2]);
         if self.res.facts().get(now).block_entity {
             self.ca_put_block_entity(target, carried.get(ca::KEY_BLOCK_ENTITY));
@@ -703,7 +881,21 @@ impl Game<'_> {
             hit.pos[1] + hit.face[1],
             hit.pos[2] + hit.face[2],
         ];
-        if !self.ca_in_world(p) {
+        // As a spawn egg used on the clicked block, the mob into `p`.
+        let mode = self.ca_mode();
+        let who = self.lan_acting_uuid;
+        let clicked = self.ca_spot(who, hit.pos);
+        if let Err(why) = ca::may_place(mode, clicked, self.ca_spot(who, p)) {
+            let at = if clicked.spawn_protected { hit.pos } else { p };
+            self.ca_refuse(why, at);
+            return false;
+        }
+        if self
+            .res
+            .facts()
+            .get(self.world.block(p[0], p[1], p[2]))
+            .full_collision
+        {
             self.ca_tell("There's no room to put it down there");
             return false;
         }
@@ -727,17 +919,19 @@ impl Game<'_> {
     /// feet: a block on the nearest free spot it can stand on, else dropped
     /// as its item holding all its data; a mob at their feet. False when it
     /// could not be done (it stays carried and is tried again).
-    fn ca_release(&mut self, carried: &Tag, feet: [f64; 3]) -> bool {
+    /// `who`: the dead carrier, a guest's UUID (None for single player's own
+    /// player), whose spawn protection a block is not left under.
+    fn ca_release(&mut self, carried: &Tag, feet: [f64; 3], who: Option<u128>) -> bool {
         match text_of(carried, ca::KEY_KIND).as_deref() {
             Some(ca::KIND_MOB) => match carried.get(ca::KEY_ENTITY) {
                 Some(entity) => self.ca_spawn_mob(entity, feet, 0.0).is_some(),
                 None => false,
             },
-            Some(ca::KIND_BLOCK) => self.ca_release_block(carried, feet),
+            Some(ca::KIND_BLOCK) => self.ca_release_block(carried, feet, who),
             _ => false,
         }
     }
-    fn ca_release_block(&mut self, carried: &Tag, feet: [f64; 3]) -> bool {
+    fn ca_release_block(&mut self, carried: &Tag, feet: [f64; 3], who: Option<u128>) -> bool {
         let registry = self.pack.assets.registry;
         let Some(text) = text_of(carried, ca::KEY_STATE) else {
             return false;
@@ -756,7 +950,9 @@ impl Game<'_> {
                 base[1] + offset[1],
                 base[2] + offset[2],
             ];
-            if !self.ca_in_world(pos) {
+            // Never where the carrier could not have placed it: under spawn
+            // protection or outside the border, it is dropped instead.
+            if !ca::may_release_at(self.ca_spot(who, pos)) {
                 continue;
             }
             let here = self
@@ -811,6 +1007,7 @@ impl Game<'_> {
         if !on(self) || self.remote.is_some() {
             return;
         }
+        self.ca_read_hub();
         let config = config(self);
         let now = self.ticks;
         if self.player.is_some() && self.lan_acting.is_none() && self.native_window() {
@@ -832,7 +1029,7 @@ impl Game<'_> {
             return;
         };
         if dead {
-            if self.ca_release(&carried, feet) {
+            if self.ca_release(&carried, feet, None) {
                 put_carried(&mut self.level.player_extra, None);
             }
             return;
@@ -871,7 +1068,13 @@ impl Game<'_> {
                 continue;
             };
             if g.dead {
-                dead.push((g.conn, g.dimension.clone(), g.position, carried.clone()));
+                dead.push((
+                    g.conn,
+                    g.uuid,
+                    g.dimension.clone(),
+                    g.position,
+                    carried.clone(),
+                ));
                 continue;
             }
             let summary = carried_summary(carried);
@@ -897,13 +1100,20 @@ impl Game<'_> {
                 }),
             );
         }
-        for (conn, dimension, feet, carried) in dead {
-            self.ca_release_guest(conn, &dimension, feet, &carried);
+        for (conn, uuid, dimension, feet, carried) in dead {
+            self.ca_release_guest(conn, uuid, &dimension, feet, &carried);
         }
     }
     /// Releases a dead guest's load in their level (put in place for it, as
     /// `execute in` does), then takes it from them.
-    fn ca_release_guest(&mut self, conn: u32, dimension: &str, feet: [f64; 3], carried: &Tag) {
+    fn ca_release_guest(
+        &mut self,
+        conn: u32,
+        uuid: u128,
+        dimension: &str,
+        feet: [f64; 3],
+        carried: &Tag,
+    ) {
         let target = Dim::from_id(dimension);
         let back = if target == self.dim {
             None
@@ -911,7 +1121,7 @@ impl Game<'_> {
             self.enter_command_level(target)
         };
         if self.dim == target
-            && self.ca_release(carried, feet)
+            && self.ca_release(carried, feet, Some(uuid))
             && let Some(g) = self.lan.as_mut().and_then(|h| h.hub.guest_mut(conn))
         {
             put_carried(&mut g.saved, None);

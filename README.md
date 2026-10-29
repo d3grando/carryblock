@@ -17,7 +17,7 @@ Inspired by Carry On (https://modrinth.com/mod/carry-on); not affiliated, no cod
 
 - a **block with a block entity** (chest, barrel, furnace, hopper, dispenser,
   shulker box, brewing stand, beehive, lectern, sign, banner, jukebox,
-  spawner, decorated pot, campfire...): the block and its whole block entity
+  decorated pot, campfire...): the block and its whole block entity
   (contents, custom name, cooking progress, bees, the book, the record...) are
   carried. With `blocks: "any"`, any single block that has an item;
 - a **mob** that is not a monster and at most `maxEntitySize` (default 1.5)
@@ -30,16 +30,20 @@ or spectator. Things that are never picked up:
 
 - what the deny lists name (by default bedrock, end portal/frame/gateway,
   nether portal, barrier, light, structure/jigsaw/command/test blocks,
-  reinforced deepslate; players, the ender dragon, the wither, the warden, the
-  elder guardian);
+  reinforced deepslate, spawners, trial spawners, vaults, budding amethyst;
+  players, the ender dragon, the wither, the warden, the elder guardian);
 - half of a two-block thing (beds, doors, tall plants) and extended pistons:
   the other half would break and drop an item;
 - blocks without an item (portals, fire, piston heads, moving pistons);
 - unbreakable blocks in survival;
 - locked containers (a `lock` on the block entity);
 - monsters (unless `mobs: "any"`), mobs bigger than `maxEntitySize`, mobs that
-  ride or are ridden, leashed mobs, mobs with a saddle, chest or inventory
-  (horses, donkeys, llamas), pets tamed by someone else.
+  ride or are ridden, leashed mobs, mobs holding other mobs' leads (a wandering
+  trader's llamas), mobs with a saddle, chest or inventory (horses, donkeys,
+  llamas), pets tamed by someone else, a mob someone is trading with, a
+  villager asleep in its bed, `Invulnerable` mobs (except in creative);
+- what the player could not break or use there: see
+  [Permissions and protection](#permissions-and-protection).
 
 A refused pick up says why in the action bar, then the click does what it
 would have done (a deny-listed chest still opens).
@@ -59,15 +63,21 @@ placement rules for its item (there must be room, it must be able to stand
 there, nothing may be in the way, it faces as a placed one would and a chest
 joins a chest next to it), then gets back its own other properties (a lit
 furnace stays lit, a hive keeps its honey, a lectern its book) and its block
-entity. A mob is let go on that face, facing you. Putting down works even when
-picking up is turned off or the settings file is broken. In adventure mode
-nothing can be put down (vanilla: no building); switch mode or see "Death".
+entity. A natural sculk shrieker or creaking heart is put down as a placed
+one (it summons no warden, spawns no creaking), as silk touch would give it.
+A mob is let go on that face, facing you, if that block has room for it.
+Putting down works even when picking up is turned off or the settings file is
+broken, wherever the player may place a block (see
+[Permissions and protection](#permissions-and-protection)). In adventure mode
+nothing can be put down, block or mob (vanilla: no building, no spawn egg);
+switch mode or see "Death".
 
 **Death.** When a carrier dies, what they carry is left where they died: a
 block on the nearest free spot (air, water, grass...) within 2 blocks of their
-feet where it can stand (never in another block entity's place); if there is
-none, it is dropped as its item holding all its data (the Ctrl + Pick Block
-form, e.g. a chest item with its contents in it). A mob is let go at their
+feet where it can stand (never in another block entity's place, under their
+spawn protection or outside the world border); if there is none, it is
+dropped as its item holding all its data (the Ctrl + Pick Block form, e.g. a
+chest item with its contents in it), as a dead player's inventory is. A mob is let go at their
 feet. Respawning, the player carries nothing.
 
 **Disconnecting, quitting, crashing.** What a player carries is part of their
@@ -75,6 +85,59 @@ own saved player data (a `carryblock:carried` compound in the player NBT), so
 it is saved, loaded and kept exactly like their inventory: a LAN guest who
 leaves still carries it when they come back; single player keeps carrying it
 after quitting and reopening the world.
+
+### Permissions and protection
+
+A pick up is the game's own break, a put down its own placement: Carry Block
+asks what the game asks a player who breaks or places that block (vanilla
+`ServerPlayerGameMode.handleBlockBreakAction`/`destroyBlock`,
+`ServerGamePacketListenerImpl.handleUseItemOn`/`handleInteract`,
+`ServerLevel.mayInteract`; Horizon's `lan_guest_packet`), and refuses with
+the reason in the action bar:
+
+| Check | Picking up a block | Picking up a mob | Putting down |
+|---|---|---|---|
+| In a loaded chunk, within the level's height | the block | the mob's block | the block it goes into |
+| Within reach (`isWithinBlockInteractionRange(pos, 1.0)`) | the block | the mob ray's 3 blocks (5 in creative) | the clicked block |
+| Spawn protection (`DedicatedServer.isUnderSpawnProtection`) | the block | the mob's block | the clicked block and the block it goes into |
+| Inside the world border (`WorldBorder.isWithinBounds`) | the block | the mob's block | the clicked block and the block it goes into |
+| May build (`Abilities.mayBuild`: survival, creative) | yes | yes | yes |
+| Game master blocks (command, structure, jigsaw, test blocks) | creative and permission level 2 | | creative and permission level 2 |
+
+- **Spawn protection** is a dedicated server's, as vanilla's: `spawn-protection`
+  blocks around the world spawn (a square, any height, the Overworld), not
+  for operators, for nobody while `ops.json` is empty or the radius is 0.
+  Single player and LAN never have it (an integrated server). A refused
+  player gets the game's own red "spawn protection" line. Vanilla checks only
+  the clicked block when placing; Carry Block also checks the block it puts
+  down into, and protects mobs too (vanilla lets anyone use a mob at spawn;
+  taking it away is more than using it).
+- **Adventure mode** (vanilla's `CanBreak`/`CanPlaceOn`) never lets a player
+  break or place with an empty hand, and Carry Block never has an item in it:
+  nothing is picked up or put down in adventure mode.
+- **Unbreakable blocks** (bedrock, end portal frames, a map's barrier) are not
+  picked up in survival, as they cannot be broken.
+- **A container someone has open** (a chest, barrel, furnace, hopper...,
+  either half of an open double chest) is not picked up: "Someone is using
+  that".
+- **Pets and mobs**: a pet tamed by someone else, a mob someone is trading
+  with, a villager asleep in its bed (it stays claimed), a mob holding leads,
+  an `Invulnerable` mob (a map's: only creative players can hurt it) are not
+  picked up.
+- **Death** never leaves a block under the dead player's spawn protection or
+  outside the border: it is dropped as its item instead.
+- **Held or repeated clicks**: a use within 5 ticks of the player's previous
+  one does nothing (see below); a refusal is said once per click.
+
+In single player nothing of this gets in the way: there is no spawn
+protection, the owner may use game master blocks with cheats on, and the
+world border is the only limit (as vanilla's integrated server has it).
+
+Deny-listed by default because no tool gets them in survival, silk touch
+included: spawners, trial spawners, vaults and budding amethyst (carrying a
+dungeon's spawner next to another's, or a vault out of a trial chamber, is
+what vanilla only lets a player destroy). A server that wants them movable
+takes them off `denyBlocks`.
 
 ### How duplication is prevented
 
@@ -151,12 +214,14 @@ value, and it applies at once, for every player, no restart:
 | Slowness while carrying: I | `slowness` | none, I, II, III, IV |
 | HUD box: bottom right | `hud` | off, top left, top right, bottom left, bottom right |
 | Action bar for other players: ON | `actionBar` | ON, OFF |
-| Deny lists: 16 blocks, 5 mobs (config.json, click to reload) | `denyBlocks`, `denyEntities` | edited in the file; a click reads it again |
+| Deny lists: 20 blocks, 5 mobs (config.json, click to reload) | `denyBlocks`, `denyEntities` | edited in the file; a click reads it again |
 | Reset to defaults (deny lists kept) | | every setting above back to its default |
 
 "Creative ignores rules" never lifts the rules that keep the world
-consistent: two-block things, blocks without an item, locks, riders, leashes,
-mob inventories and other players' pets.
+consistent or a server's permissions: two-block things, blocks without an
+item, locks, open containers, riders, leashes, mob inventories, other players'
+pets, trading and sleeping mobs, game master blocks, spawn protection and the
+world border.
 
 The HUD box is drawn by the window from what the game simulating the world
 says (single player and LAN hosts: same process). On another computer's
@@ -226,7 +291,10 @@ Beyond hooks, `native.rs` uses the pinned game's internals: block entities
 Horizon keeps as loaded), the block behaviour library (`set_block`,
 `placement_state`, `can_survive`), mobs' saved compounds (`mob_tree_nbt`,
 `load_mob`), the player compound (`Level::player_extra`, `Guest::saved`), the
-hub's players and their effects.
+hub's players and their effects, and for permissions the hub's
+`spawn_protection`, operators, permission levels, open menus and trades (read
+every tick: a guest's turn runs with the hub taken out of the game), the
+world border and the world spawn.
 
 Pinned: Horizon `142388e1c136e622652ec7505af15d8ad195e041`, horizon-mixins
 `0d6b103c70633d8fd9443d8d0acd3aadaacedb06`, game 26.3: the same revisions as
@@ -255,8 +323,10 @@ a folder holding several native mods (with TreeFall and Mason, for example).
 
 - `horizon-mixin.toml`: two support modules and seven HEAD hooks (above).
 - `runtime.rs`: every decision as pure code with unit tests: the settings and
-  their page, deny lists, what may be picked up, the state a block is put down
-  with, where a dead carrier's block goes, held-button detection, slowness,
+  their page, deny lists, what may be picked up, who may pick up or put down
+  where (spawn protection, the world border, reach, building), the state a
+  block is put down with, where a dead carrier's block goes, held-button
+  detection, slowness,
   texts, commands. It is both this repository's Cargo library and the injected
   `crate::game::carryblock` module.
 - `native.rs`: the adapter to the game (`crate::game::carryblock_native`).
