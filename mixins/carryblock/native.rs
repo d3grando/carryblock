@@ -19,10 +19,10 @@
 // operators, permission levels, open containers, trades) is read at every
 // tick (`HubView`).
 use super::carryblock::{
-    self as ca, BlockInfo, Command, Config, Effect, HudCorner, Loaded, MobInfo, Mode, Refusal,
-    SpawnRules, Spot, State, Uuid, Verdict,
+    self as ca, BlockInfo, Command, Config, Effect, HudBoard, HudCorner, Loaded, MobInfo, Mode,
+    PickUp, Refusal, SpawnRules, Spot, State, Uuid, Verdict,
 };
-use super::{Dim, Game, GuestUse, Hit};
+use super::{Dim, Game, GuestUse, Hit, Screen};
 use horizon_client::blocks::Fluid;
 use horizon_client::command::args::GameMode;
 use horizon_client::containers::BlockEntity;
@@ -42,10 +42,10 @@ use horizon_world::level::{LevelEvent, PlaceContext, flags};
 use horizon_world::nbt::{Compound, JavaString, Tag};
 use horizon_world::registry::BlockStateId;
 use std::cell::RefCell;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 /// What the window's game and single player's server thread share (one
 /// process): the configuration, and what each player carries as the server
@@ -53,11 +53,11 @@ use std::time::{Duration, Instant};
 struct Shared {
     /// `config.json` as last read; None until something needs it.
     config: Option<Loaded>,
-    hud: BTreeMap<Uuid, (String, Instant)>,
+    hud: HudBoard,
 }
 static SHARED: std::sync::Mutex<Shared> = std::sync::Mutex::new(Shared {
     config: None,
-    hud: BTreeMap::new(),
+    hud: HudBoard::new(),
 });
 /// Options > Mods' on/off as the window's game last saw it: single player's
 /// server thread keeps the options it started with, so it follows the
@@ -197,13 +197,12 @@ fn is_locked(data: &Tag) -> bool {
 }
 /// The window's HUD box hears what `who` carries.
 fn note_hud(who: Uuid, summary: &str) {
-    shared(|s| {
-        s.hud.insert(who, (summary.to_owned(), Instant::now()));
-        if s.hud.len() > 64 {
-            let fresh = Duration::from_millis(ca::HUD_FRESH_MS);
-            s.hud.retain(|_, (_, at)| at.elapsed() < fresh);
-        }
-    });
+    shared(|s| s.hud.note(who, summary, Instant::now()));
+}
+/// The window's HUD box hears `who` carries nothing any more (put down,
+/// dropped, dead): it goes at once.
+fn forget_hud(who: Uuid) {
+    shared(|s| s.hud.forget(who));
 }
 /// Gives a carrier their slowness when it is missing or about to end; true
 /// when it changed.
@@ -565,9 +564,8 @@ impl Game<'_> {
             .inventory
             .get(self.selected)
             .is_none_or(Option::is_none);
-        if !fresh
-            || !ca::player_may_pick_up(&config, self.ca_mode(), self.ca_sneaking(), hand_empty)
-        {
+        let pick = ca::pick_up(&config, self.ca_mode(), self.ca_sneaking(), hand_empty);
+        if !fresh || pick == PickUp::No {
             return None;
         }
         let mob = match guest {
@@ -578,9 +576,9 @@ impl Game<'_> {
         };
         let picked = self.with_player_actor(|game| {
             if mob {
-                game.ca_pick_mob(&config)
+                game.ca_pick_mob(&config, pick)
             } else {
-                game.ca_pick_block(&config)
+                game.ca_pick_block(&config, pick)
             }
         });
         picked.then_some(Some(Hand::Main))
@@ -588,8 +586,9 @@ impl Game<'_> {
 
     /// Picks up the block aimed at, with its block entity: true when it
     /// did. The block goes without dropping anything (its block entity is
-    /// carried, not spilled); a waterlogged one leaves its water.
-    fn ca_pick_block(&mut self, config: &Config) -> bool {
+    /// carried, not spilled); a waterlogged one leaves its water. A player
+    /// who may not build (`pick`) only hears so.
+    fn ca_pick_block(&mut self, config: &Config, pick: PickUp) -> bool {
         let Some(hit) = self.pick() else {
             return false;
         };
@@ -629,7 +628,7 @@ impl Game<'_> {
         let verdict = ca::block_verdict(config, mode, game_master, &info, &|tag| {
             self.ca_block_in_tag(tag, &name)
         });
-        match verdict {
+        match ca::verdict_for(pick, verdict) {
             Verdict::Allow => {}
             Verdict::Pass => return false,
             Verdict::Refuse(why) => {
@@ -691,8 +690,9 @@ impl Game<'_> {
         true
     }
 
-    /// Picks up the mob aimed at, with all its data: true when it did.
-    fn ca_pick_mob(&mut self, config: &Config) -> bool {
+    /// Picks up the mob aimed at, with all its data: true when it did. A
+    /// player who may not build (`pick`) only hears so.
+    fn ca_pick_mob(&mut self, config: &Config, pick: PickUp) -> bool {
         let Some((index, distance)) = self.mob_hit() else {
             return false;
         };
@@ -744,7 +744,7 @@ impl Game<'_> {
             Some(custom) => format!("{custom} ({})", ca::display_name(&m.kind.id)),
             None => ca::display_name(&m.kind.id),
         };
-        match ca::mob_verdict(config, mode, &info) {
+        match ca::verdict_for(pick, ca::mob_verdict(config, mode, &info)) {
             Verdict::Allow => {}
             Verdict::Pass => return false,
             Verdict::Refuse(why) => {
@@ -853,6 +853,8 @@ impl Game<'_> {
         // The block is in the world: from here on it is not carried any
         // more, whatever happens to it next.
         put_carried(&mut self.level.player_extra, None);
+        let me = self.acting_player_uuid();
+        forget_hud(me);
         let now = self.world.block(target[0], target[1], target[2]);
         if self.res.facts().get(now).block_entity {
             self.ca_put_block_entity(target, carried.get(ca::KEY_BLOCK_ENTITY));
@@ -910,6 +912,8 @@ impl Game<'_> {
             return false;
         }
         put_carried(&mut self.level.player_extra, None);
+        let me = self.acting_player_uuid();
+        forget_hud(me);
         self.ca_clear_slowness();
         self.swing_arm();
         true
@@ -1029,6 +1033,7 @@ impl Game<'_> {
             return;
         };
         if dead {
+            forget_hud(self.level.ensure_player_uuid());
             if self.ca_release(&carried, feet, None) {
                 put_carried(&mut self.level.player_extra, None);
             }
@@ -1068,6 +1073,7 @@ impl Game<'_> {
                 continue;
             };
             if g.dead {
+                forget_hud(horizon_client::lan::playerdata::uuid_ints(g.uuid));
                 dead.push((
                     g.conn,
                     g.uuid,
@@ -1137,7 +1143,8 @@ impl Game<'_> {
         if !on(self) {
             return;
         }
-        let corner = match config(self).hud {
+        let hud = config(self).hud;
+        let corner = match hud {
             HudCorner::Off => return,
             HudCorner::TopLeft => Corner::TopLeft,
             HudCorner::TopRight => Corner::TopRight,
@@ -1154,13 +1161,14 @@ impl Game<'_> {
                 None => return,
             },
         };
-        let fresh = Duration::from_millis(ca::HUD_FRESH_MS);
-        let Some(summary) = shared(|s| {
-            s.hud
-                .get(&me)
-                .filter(|(_, at)| at.elapsed() < fresh)
-                .map(|(text, _)| text.clone())
-        }) else {
+        // The death screen: what was carried is being left where they died.
+        let dead = self.screen == Screen::Dead
+            || self
+                .player
+                .as_ref()
+                .is_some_and(|p| p.health.dead_or_dying());
+        let Some(summary) = shared(|s| s.hud.shown(me, Instant::now(), dead).map(str::to_owned))
+        else {
             return;
         };
         let [first, second] = ca::hud_lines(&summary);
@@ -1169,7 +1177,18 @@ impl Game<'_> {
             .max(self.native_text_width(&second))
             + 6.0;
         let height = 22.0;
-        let (x, y) = corners.place(corner, width, height);
+        let (x, y) = if ca::hud_crosses_hotbar(hud, batch.width, width) {
+            // A bottom box that would cover the hotbar, the bars over it or
+            // the action bar goes up over them. How far up its corner is
+            // taken already (the minimap, boxes placed before it) is
+            // `Corners`' own: an empty box finds out, then the room left
+            // under the box makes up the rest.
+            let (_, probe) = corners.place(corner, width, 0.0);
+            let room = ca::hud_room_under(batch.height - probe);
+            corners.place(corner, width, room + height)
+        } else {
+            corners.place(corner, width, height)
+        };
         self.native_fill(batch, [x, y, width, height], 0x7800_0000);
         self.native_text(batch, &first, [x + 3.0, y + 3.0], 0xFF_FFFF, true);
         self.native_text(batch, &second, [x + 3.0, y + 12.0], 0xAA_AAAA, true);

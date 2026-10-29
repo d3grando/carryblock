@@ -11,6 +11,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::time::{Duration, Instant};
 
 /// A player's UUID as the game keeps it.
 pub type Uuid = [i32; 4];
@@ -18,7 +19,7 @@ pub type Uuid = [i32; 4];
 /// The mod's id: its row in Options > Mods and its settings folder
 /// (`horizon-mods/.horizon-mod-data/carryblock/`).
 pub const ID: &str = "carryblock";
-pub const VERSION: &str = "0.1.1";
+pub const VERSION: &str = "0.1.2";
 pub const DESCRIPTION: &str = "Sneak and right click with an empty hand to pick up a chest, a \
 furnace or a small animal with everything in it; right click a block to put it down.";
 /// The configuration, in the mod's settings folder: what the settings page
@@ -57,8 +58,25 @@ pub const SLOWNESS_TICKS: i32 = 40;
 pub const SLOWNESS_REFRESH: i32 = 10;
 /// How often a remote carrier is reminded in their action bar (ticks).
 pub const ACTION_BAR_EVERY: u64 = 40;
-/// How long the HUD box shows after the server last said what is carried.
+/// How long the HUD box shows after the server last said what is carried
+/// (a server that stops saying it, without a put down, a drop or a death:
+/// those take the box away at once).
 pub const HUD_FRESH_MS: u64 = 1500;
+/// The gap `Corners::place` leaves between a box and the screen's edge or
+/// the box before it.
+pub const HUD_MARGIN: f32 = 2.0;
+/// Half the width of the column over the hotbar, from the screen's centre:
+/// the hotbar's 91, plus the off hand's slot (29) on either side (the left,
+/// or the right for a left-handed player; the hotbar attack indicator fits
+/// in it too). The hearts, armour, food, air and XP bars, the held item's
+/// name and the action bar are all inside it (or centred on it).
+pub const HOTBAR_HALF_WIDTH: f32 = 120.0;
+/// How far up from the screen's bottom the column over the hotbar is taken:
+/// the action bar (`Hud.extractOverlayMessage`: its line 68 up, text from 4
+/// above, its backdrop 2 more), over the held item's name (59), armour and
+/// air (49), hearts and food (39), the XP bar and the hotbar; two rows of
+/// hearts still fit under it.
+pub const ABOVE_HOTBAR: f32 = 74.0;
 /// How far from a dead carrier's feet a block is put down.
 pub const RELEASE_RADIUS: i32 = 2;
 
@@ -352,17 +370,46 @@ impl Refusal {
     }
 }
 
-/// Whether this player may pick something up with this click at all:
-/// sneaking, the main hand empty, and their game mode allowed.
-pub fn player_may_pick_up(config: &Config, mode: Mode, sneaking: bool, hand_empty: bool) -> bool {
-    config.enabled
-        && sneaking
-        && hand_empty
-        && match mode {
-            Mode::Survival => config.survival,
-            Mode::Creative => config.creative,
-            Mode::Adventure | Mode::Spectator => false,
-        }
+/// What a sneaking right click with an empty main hand may do for a player.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PickUp {
+    /// Nothing: the game uses the click as usual.
+    No,
+    /// Pick up what they aim at, if Carry Block's rules let them.
+    Yes,
+    /// They may not build (adventure mode, `Abilities.mayBuild`): what a
+    /// survival player would pick up, they hear they can't ("You can't build
+    /// here", as putting down says), and the game uses the click as usual (a
+    /// chest opens).
+    CantBuild,
+}
+
+/// What this click may do: sneaking, the main hand empty, and their game
+/// mode allowed (adventure players as survival players are, see
+/// [`PickUp::CantBuild`]).
+pub fn pick_up(config: &Config, mode: Mode, sneaking: bool, hand_empty: bool) -> PickUp {
+    if !(config.enabled && sneaking && hand_empty) {
+        return PickUp::No;
+    }
+    match mode {
+        Mode::Survival if config.survival => PickUp::Yes,
+        Mode::Creative if config.creative => PickUp::Yes,
+        Mode::Adventure if config.survival => PickUp::CantBuild,
+        _ => PickUp::No,
+    }
+}
+
+/// The verdict for a player [`pick_up`] answered `pick` for: one who may
+/// not build hears so where they would have picked it up; a refusal stays
+/// what it is (they would hear it in survival too), and what Carry Block
+/// leaves to the game stays silent.
+pub fn verdict_for(pick: PickUp, verdict: Verdict) -> Verdict {
+    match (pick, verdict) {
+        (PickUp::Yes, v) => v,
+        (PickUp::CantBuild, Verdict::Allow) => Verdict::Refuse(Refusal::CantBuild),
+        (PickUp::CantBuild, v) => v,
+        (PickUp::No, _) => Verdict::Pass,
+    }
 }
 
 fn ignores_rules(config: &Config, mode: Mode) -> bool {
@@ -587,13 +634,20 @@ pub fn block_verdict(
     block: &BlockInfo,
     in_tag: &dyn Fn(&str) -> bool,
 ) -> Verdict {
-    if block.empty {
+    if block.empty || config.blocks == BlockRule::Off {
         return Verdict::Pass;
     }
-    match config.blocks {
-        BlockRule::Off => return Verdict::Pass,
-        BlockRule::WithData if !block.block_entity => return Verdict::Pass,
-        BlockRule::WithData | BlockRule::Any => {}
+    let bypass = ignores_rules(config, mode);
+    let deny_listed = !bypass && denied(&config.deny_blocks, &block.name, in_tag);
+    // A block the setting leaves out (only blocks with data, by default):
+    // the click is the game's, silently (dirt, stone), unless the block is
+    // on the deny list (bedrock), which says so whatever the setting.
+    if config.blocks == BlockRule::WithData && !block.block_entity {
+        return if deny_listed {
+            Verdict::Refuse(Refusal::Denied)
+        } else {
+            Verdict::Pass
+        };
     }
     // Permissions and the world's consistency first: no setting lifts them.
     if block.game_master && !game_master {
@@ -602,8 +656,7 @@ pub fn block_verdict(
     if block.in_use {
         return Verdict::Refuse(Refusal::InUse);
     }
-    let bypass = ignores_rules(config, mode);
-    if !bypass && denied(&config.deny_blocks, &block.name, in_tag) {
+    if deny_listed {
         return Verdict::Refuse(Refusal::Denied);
     }
     if block.item.is_none() {
@@ -836,6 +889,68 @@ pub fn hud_lines(summary: &str) -> [String; 2] {
         "Right click a block to put it down".into(),
     ]
 }
+/// Whether a box `w` wide in `corner` of a screen `screen_w` GUI pixels
+/// wide, placed as `Corners::place` places it (its side's edge
+/// [`HUD_MARGIN`] away), would cover the column over the hotbar (a bottom
+/// corner only).
+pub fn hud_crosses_hotbar(corner: HudCorner, screen_w: f32, w: f32) -> bool {
+    let x = match corner {
+        HudCorner::BottomLeft => HUD_MARGIN,
+        HudCorner::BottomRight => screen_w - HUD_MARGIN - w,
+        HudCorner::Off | HudCorner::TopLeft | HudCorner::TopRight => return false,
+    };
+    let centre = screen_w / 2.0;
+    x < centre + HOTBAR_HALF_WIDTH && x + w > centre - HOTBAR_HALF_WIDTH
+}
+/// For a box [`hud_crosses_hotbar`]: the empty room to reserve under it, in
+/// its corner, so that it sits [`HUD_MARGIN`] over [`ABOVE_HOTBAR`]. `taken`
+/// is how far up from the bottom the corner is taken already (where an
+/// empty `Corners::place` puts its box, from the bottom: the boxes placed
+/// before this one and one margin); 0 when they lift it high enough.
+pub fn hud_room_under(taken: f32) -> f32 {
+    (ABOVE_HOTBAR - taken).max(0.0)
+}
+
+/// What the window's HUD box says each player carries, as the game that
+/// simulates the world last said (it may be single player's server thread).
+#[derive(Clone, Debug, Default)]
+pub struct HudBoard {
+    lines: BTreeMap<Uuid, (String, Instant)>,
+}
+impl HudBoard {
+    pub const fn new() -> Self {
+        Self {
+            lines: BTreeMap::new(),
+        }
+    }
+    /// `who` carries `summary`, as of `now`.
+    pub fn note(&mut self, who: Uuid, summary: &str, now: Instant) {
+        self.lines.insert(who, (summary.to_owned(), now));
+        if self.lines.len() > 64 {
+            let fresh = Duration::from_millis(HUD_FRESH_MS);
+            self.lines
+                .retain(|_, (_, at)| now.saturating_duration_since(*at) < fresh);
+        }
+    }
+    /// `who` carries nothing any more (put down, dropped, dead): the box
+    /// goes at once.
+    pub fn forget(&mut self, who: Uuid) {
+        self.lines.remove(&who);
+    }
+    /// What the box shows for `who` at `now`: nothing while they are `dead`
+    /// (the death screen), nor once the server stopped saying it.
+    pub fn shown(&self, who: Uuid, now: Instant, dead: bool) -> Option<&str> {
+        if dead {
+            return None;
+        }
+        let fresh = Duration::from_millis(HUD_FRESH_MS);
+        self.lines
+            .get(&who)
+            .filter(|(_, at)| now.saturating_duration_since(*at) < fresh)
+            .map(|(text, _)| text.as_str())
+    }
+}
+
 /// A remote player's action bar.
 pub fn action_bar_text(summary: &str) -> String {
     format!("Carrying {summary} - right click a block to put it down")
@@ -1218,23 +1333,203 @@ mod tests {
     #[test]
     fn who_may_pick_up() {
         let c = Config::default();
-        assert!(player_may_pick_up(&c, Mode::Survival, true, true));
-        assert!(player_may_pick_up(&c, Mode::Creative, true, true));
-        assert!(!player_may_pick_up(&c, Mode::Survival, false, true));
-        assert!(!player_may_pick_up(&c, Mode::Survival, true, false));
-        assert!(!player_may_pick_up(&c, Mode::Adventure, true, true));
-        assert!(!player_may_pick_up(&c, Mode::Spectator, true, true));
+        assert_eq!(pick_up(&c, Mode::Survival, true, true), PickUp::Yes);
+        assert_eq!(pick_up(&c, Mode::Creative, true, true), PickUp::Yes);
+        assert_eq!(pick_up(&c, Mode::Survival, false, true), PickUp::No);
+        assert_eq!(pick_up(&c, Mode::Survival, true, false), PickUp::No);
+        assert_eq!(pick_up(&c, Mode::Adventure, true, true), PickUp::CantBuild);
+        assert_eq!(pick_up(&c, Mode::Adventure, false, true), PickUp::No);
+        assert_eq!(pick_up(&c, Mode::Adventure, true, false), PickUp::No);
+        assert_eq!(pick_up(&c, Mode::Spectator, true, true), PickUp::No);
         let off = Config {
             survival: false,
             ..Config::default()
         };
-        assert!(!player_may_pick_up(&off, Mode::Survival, true, true));
-        assert!(player_may_pick_up(&off, Mode::Creative, true, true));
+        assert_eq!(pick_up(&off, Mode::Survival, true, true), PickUp::No);
+        assert_eq!(pick_up(&off, Mode::Adventure, true, true), PickUp::No);
+        assert_eq!(pick_up(&off, Mode::Creative, true, true), PickUp::Yes);
         let disabled = Config {
             enabled: false,
             ..Config::default()
         };
-        assert!(!player_may_pick_up(&disabled, Mode::Creative, true, true));
+        assert_eq!(pick_up(&disabled, Mode::Creative, true, true), PickUp::No);
+        assert_eq!(pick_up(&disabled, Mode::Adventure, true, true), PickUp::No);
+    }
+
+    #[test]
+    fn adventure_players_hear_they_cant_build() {
+        let c = Config::default();
+        let pick = pick_up(&c, Mode::Adventure, true, true);
+        // What a survival player would pick up: "You can't build here" (the
+        // click is still the game's: the chest opens).
+        let chested = block_verdict(&c, Mode::Adventure, false, &chest(), &no_tags);
+        assert_eq!(chested, Verdict::Allow);
+        assert_eq!(
+            verdict_for(pick, chested),
+            Verdict::Refuse(Refusal::CantBuild)
+        );
+        assert_eq!(Refusal::CantBuild.message(), "You can't build here");
+        let piggy = mob_verdict(&c, Mode::Adventure, &pig());
+        assert_eq!(
+            verdict_for(pick, piggy),
+            Verdict::Refuse(Refusal::CantBuild)
+        );
+        // Dirt stays silent; a refusal says what it says in survival.
+        let dirt = block_verdict(&c, Mode::Adventure, false, &dirt(), &no_tags);
+        assert_eq!(verdict_for(pick, dirt), Verdict::Pass);
+        let locked = BlockInfo {
+            locked: true,
+            ..chest()
+        };
+        let locked = block_verdict(&c, Mode::Adventure, false, &locked, &no_tags);
+        assert_eq!(verdict_for(pick, locked), Verdict::Refuse(Refusal::Locked));
+        // Survival and creative players' verdicts are their own.
+        for v in [
+            Verdict::Allow,
+            Verdict::Pass,
+            Verdict::Refuse(Refusal::Denied),
+        ] {
+            assert_eq!(verdict_for(PickUp::Yes, v), v);
+            assert_eq!(verdict_for(PickUp::No, v), Verdict::Pass);
+        }
+    }
+
+    #[test]
+    fn deny_listed_blocks_say_so_whatever_the_setting() {
+        // Default settings (blocks with data only): bedrock has no block
+        // entity, but it is on the deny list, so it says so.
+        let c = Config::default();
+        assert_eq!(c.blocks, BlockRule::WithData);
+        let bedrock = BlockInfo {
+            name: "minecraft:bedrock".into(),
+            hardness: -1.0,
+            item: Some("minecraft:bedrock".into()),
+            ..dirt()
+        };
+        let refused = block_verdict(&c, Mode::Survival, false, &bedrock, &no_tags);
+        assert_eq!(refused, Verdict::Refuse(Refusal::Denied));
+        assert_eq!(Refusal::Denied.message(), "That can't be carried");
+        assert_eq!(
+            block_verdict(&c, Mode::Creative, false, &bedrock, &no_tags),
+            Verdict::Refuse(Refusal::Denied)
+        );
+        // By a block tag too.
+        let listed = Config {
+            deny_blocks: vec!["#minecraft:dirt".into()],
+            ..Config::default()
+        };
+        assert_eq!(
+            block_verdict(&listed, Mode::Survival, false, &dirt(), &|t| {
+                t == "minecraft:dirt"
+            }),
+            Verdict::Refuse(Refusal::Denied)
+        );
+        // A plain block the setting leaves out stays silent (the click is
+        // the game's, as vanilla's right click on dirt).
+        assert_eq!(
+            block_verdict(&c, Mode::Survival, false, &dirt(), &no_tags),
+            Verdict::Pass
+        );
+        // Creative ignoring the rules: bedrock is like dirt then.
+        let bypass = Config {
+            creative_ignores_rules: true,
+            ..Config::default()
+        };
+        assert_eq!(
+            block_verdict(&bypass, Mode::Creative, false, &bedrock, &no_tags),
+            Verdict::Pass
+        );
+        assert_eq!(
+            block_verdict(&bypass, Mode::Survival, false, &bedrock, &no_tags),
+            Verdict::Refuse(Refusal::Denied)
+        );
+        // Picking up blocks off: nothing is said.
+        let off = Config {
+            blocks: BlockRule::Off,
+            ..Config::default()
+        };
+        assert_eq!(
+            block_verdict(&off, Mode::Survival, false, &bedrock, &no_tags),
+            Verdict::Pass
+        );
+    }
+
+    #[test]
+    fn a_bottom_box_clears_the_hotbar() {
+        // The box the tester saw: 1280x720 at GUI scale 3 is 427 x 240 GUI
+        // pixels, the hotbar 122.5..304.5; a box about 170 wide at the
+        // bottom right starts at 255, over the hotbar's right end.
+        assert!(hud_crosses_hotbar(HudCorner::BottomRight, 427.0, 170.0));
+        assert!(hud_crosses_hotbar(HudCorner::BottomLeft, 427.0, 170.0));
+        // A narrow one fits beside it (the column ends at 333.5).
+        assert!(!hud_crosses_hotbar(HudCorner::BottomRight, 427.0, 80.0));
+        assert!(!hud_crosses_hotbar(HudCorner::BottomLeft, 427.0, 80.0));
+        // Top corners never meet it.
+        assert!(!hud_crosses_hotbar(HudCorner::TopRight, 427.0, 400.0));
+        assert!(!hud_crosses_hotbar(HudCorner::TopLeft, 427.0, 400.0));
+        assert!(!hud_crosses_hotbar(HudCorner::Off, 427.0, 400.0));
+        // Every GUI scale and window size: a box crosses exactly when its
+        // side's room beside the column is too narrow for it.
+        for (pixels, scale) in [
+            ([1280.0, 720.0], 3.0),
+            ([1920.0, 1080.0], 4.0),
+            ([1920.0, 1080.0], 2.0),
+            ([854.0, 480.0], 2.0),
+            ([3840.0, 2160.0], 6.0),
+            ([640.0, 480.0], 1.0),
+        ] {
+            let screen_w: f32 = pixels[0] / scale;
+            let room = screen_w / 2.0 - HOTBAR_HALF_WIDTH - HUD_MARGIN;
+            for w in [40.0, 80.0, 120.0, 170.0, 260.0] {
+                for corner in [HudCorner::BottomLeft, HudCorner::BottomRight] {
+                    assert_eq!(
+                        hud_crosses_hotbar(corner, screen_w, w),
+                        w > room,
+                        "{pixels:?} at {scale}, {w} wide, {corner:?}"
+                    );
+                }
+            }
+        }
+        // Lifted: an empty corner (one margin taken) reserves the rest of
+        // the way up, so the box's bottom is a margin over the action bar.
+        let height = 240.0;
+        let taken = HUD_MARGIN;
+        let room = hud_room_under(taken);
+        assert_eq!(room, ABOVE_HOTBAR - HUD_MARGIN);
+        // As `Corners::place` then places a box `h` high with `room` under it.
+        let h = 22.0;
+        let edge = taken + HUD_MARGIN;
+        let y = height - edge - (room + h);
+        assert_eq!(y + h, height - ABOVE_HOTBAR - HUD_MARGIN);
+        // A corner already taken higher than that lifts it on its own.
+        assert_eq!(hud_room_under(ABOVE_HOTBAR), 0.0);
+        assert_eq!(hud_room_under(ABOVE_HOTBAR + 30.0), 0.0);
+        assert_eq!(hud_room_under(50.0), ABOVE_HOTBAR - 50.0);
+    }
+
+    #[test]
+    fn the_hud_box_goes_with_the_load() {
+        let me = [1, 2, 3, 4];
+        let other = [5, 6, 7, 8];
+        let t0 = Instant::now();
+        let mut board = HudBoard::new();
+        assert_eq!(board.shown(me, t0, false), None);
+        board.note(me, "Chest (8 stacks)", t0);
+        board.note(other, "Pig", t0);
+        assert_eq!(board.shown(me, t0, false), Some("Chest (8 stacks)"));
+        // Not while dead (the death screen).
+        assert_eq!(board.shown(me, t0, true), None);
+        // Put down or dropped: gone at once, not after the timeout.
+        board.forget(me);
+        assert_eq!(board.shown(me, t0, false), None);
+        assert_eq!(board.shown(other, t0, false), Some("Pig"));
+        // A server that stops saying it: gone after the timeout.
+        let later = t0 + Duration::from_millis(HUD_FRESH_MS);
+        assert_eq!(
+            board.shown(other, later - Duration::from_millis(1), false),
+            Some("Pig")
+        );
+        assert_eq!(board.shown(other, later, false), None);
     }
 
     #[test]

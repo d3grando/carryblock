@@ -11,6 +11,25 @@ Inspired by Carry On (https://modrinth.com/mod/carry-on); not affiliated, no cod
 > Rust source compiled into your own Horizon executable and runs with your user
 > rights. Read the source (it is small: `mixins/carryblock/`) before building.
 
+## What's new in 0.1.2
+
+- **The HUD box keeps off the hotbar.** In a bottom corner, a box that would
+  cover the column over the hotbar (the hotbar, the off hand's slot, the XP
+  bar, hearts, armour, food and the action bar) goes up over the action bar
+  instead, at every GUI scale and window size; a box narrow enough to fit
+  beside the hotbar stays in the corner.
+- **The HUD box goes with the load.** It disappears the moment the load is put
+  down or left behind at death, and never shows on the death screen (it used
+  to linger for up to 1.5 seconds).
+- **Deny-listed blocks say so.** With the default `blocks: "withData"`,
+  bedrock (and anything else on `denyBlocks`) answers "That can't be carried"
+  instead of nothing. A plain block the setting leaves out (dirt, stone) stays
+  silent, as vanilla's right click on it is.
+- **Adventure mode says why.** A sneaking empty-handed right click on
+  something a survival player would pick up says "You can't build here" (as
+  putting down already did); the click still does what it does in vanilla (a
+  chest opens).
+
 ## Behaviour
 
 **Picking up.** Sneak, empty main hand, right click:
@@ -26,7 +45,9 @@ Inspired by Carry On (https://modrinth.com/mod/carry-on); not affiliated, no cod
   equipment, UUID).
 
 It works in survival and creative (each can be turned off), never in adventure
-or spectator. Things that are never picked up:
+or spectator (in adventure, what a survival player would pick up says "You
+can't build here", then the click does what it would have done). Things that
+are never picked up:
 
 - what the deny lists name (by default bedrock, end portal/frame/gateway,
   nether portal, barrier, light, structure/jigsaw/command/test blocks,
@@ -46,14 +67,19 @@ or spectator. Things that are never picked up:
   [Permissions and protection](#permissions-and-protection).
 
 A refused pick up says why in the action bar, then the click does what it
-would have done (a deny-listed chest still opens).
+would have done (a deny-listed chest still opens). A deny-listed block says
+so whatever `blocks` is set to (bedrock: "That can't be carried"); a block
+that only the `blocks` setting leaves out (dirt with the default "with data")
+is left to the game without a word, so sneaking around a build never fills the
+action bar.
 
 **Carrying.** One thing at a time. The hand slot stays as it was: what is
 carried is **not an item**, so it cannot be dropped, stored, thrown into a
 hopper or crafted. While carrying, the player has **Slowness I** (setting:
 none to IV; a stronger slowness from a potion is left alone), the window shows
 a box "Carrying: Chest (12 stacks) / Right click a block to put it down"
-(setting: which corner, or off) and other players (LAN guests, a server's
+(setting: which corner, or off; see [The HUD box](#the-hud-box)) and other
+players (LAN guests, a server's
 players) get the same reminder in their action bar every 2 seconds. Every right
 click goes to putting down: no item is used and nothing is opened while
 carrying.
@@ -114,7 +140,11 @@ the reason in the action bar:
   taking it away is more than using it).
 - **Adventure mode** (vanilla's `CanBreak`/`CanPlaceOn`) never lets a player
   break or place with an empty hand, and Carry Block never has an item in it:
-  nothing is picked up or put down in adventure mode.
+  nothing is picked up or put down in adventure mode. Both say "You can't
+  build here": putting down on any click, picking up on a click at what a
+  survival player would pick up (a chest, a pig; the chest still opens, as it
+  does in vanilla). Sneaking at dirt or a button says nothing, and a held
+  button says it once.
 - **Unbreakable blocks** (bedrock, end portal frames, a map's barrier) are not
   picked up in survival, as they cannot be broken.
 - **A container someone has open** (a chest, barrel, furnace, hopper...,
@@ -223,9 +253,23 @@ item, locks, open containers, riders, leashes, mob inventories, other players'
 pets, trading and sleeping mobs, game master blocks, spawn protection and the
 world border.
 
+### The HUD box
+
 The HUD box is drawn by the window from what the game simulating the world
 says (single player and LAN hosts: same process). On another computer's
-server, the action bar shows it instead.
+server, the action bar shows it instead. It goes the moment the load is put
+down or left behind at death, and doesn't show on the death screen.
+
+In a bottom corner (bottom right by default), a box too wide for the room
+beside the hotbar would cover its end: there it goes up instead, a margin over
+the action bar (74 GUI pixels from the bottom), clear of the hotbar, the off
+hand's slot, the XP bar, two rows of hearts, armour, food, air and the held
+item's name. The room beside the hotbar is half the screen's GUI width less
+120 (the hotbar's half, 91, and the off hand's slot, 29), so it is worked out
+for every GUI scale and window size: at 1280x720 and GUI scale 3 (427 GUI
+pixels wide) about 90 pixels, so "Carrying: Chest (8 stacks)" goes up; on a
+wide screen at a small GUI scale it stays in the corner. Boxes other mods put
+in the same corner first (the minimap) still stack under it.
 
 ## Configuration file
 
@@ -272,8 +316,9 @@ them for everything they cover:
 - `native_tick`: slowness, the HUD/action bar, releasing a dead carrier's
   load; the window passes Options > Mods' on/off to single player's server
   thread;
-- `native_hud`: the HUD box (placed with `Corners`, drawn with `native_fill`
-  and `native_text`, hidden where `native_corner_shown` says F3 is);
+- `native_hud`: the HUD box (placed with `Corners`, lifted over the hotbar in
+  a bottom corner, drawn with `native_fill` and `native_text`, hidden where
+  `native_corner_shown` says F3 is; the death screen is the game's `Screen`);
 - `native_command`: `/carryblock`;
 - `native_mods`, `native_settings`, `native_settings_click`: the row in
   Options > Mods and the settings page; `native_setting`/`native_set_setting`
@@ -299,7 +344,10 @@ world border and the world spawn.
 Pinned: Horizon `142388e1c136e622652ec7505af15d8ad195e041`, horizon-mixins
 `0d6b103c70633d8fd9443d8d0acd3aadaacedb06`, game 26.3: the same revisions as
 TreeFall 0.3.0 and Mason 0.2.0, so the three build into one game (checked:
-planned and applied together, 23 injections, 14 modules). Mason also hooks
+planned and applied together, 23 injections, 14 modules; 0.1.2 also with TreeFall,
+BiomeCompass 0.2.2, LookAt, EnchantmentHints, ItemNew, MouseTricks and
+SmartF3: 55 injections, 17 modules, and `cargo check -p horizon-client
+--features mods` of the applied source). Mason also hooks
 `Game::use_item`, for its wand (a wooden axe, creative only); Carry Block's
 priority is 250, below Mason's 300, so a creative player holding the wand
 selects with it even while carrying. A pick up always needs an empty hand, so
@@ -326,7 +374,7 @@ a folder holding several native mods (with TreeFall and Mason, for example).
   their page, deny lists, what may be picked up, who may pick up or put down
   where (spawn protection, the world border, reach, building), the state a
   block is put down with, where a dead carrier's block goes, held-button
-  detection, slowness,
+  detection, slowness, where the HUD box goes and when it shows,
   texts, commands. It is both this repository's Cargo library and the injected
   `crate::game::carryblock` module.
 - `native.rs`: the adapter to the game (`crate::game::carryblock_native`).
