@@ -1,5 +1,5 @@
 [mod]
-id = "carryalong"
+id = "carryblock"
 version = "0.1.0"
 # Between TreeFall (200) and Mason (300). Mason also hooks Game::use_item, for
 # its wand in creative only (a wooden axe: never an empty hand, so never a
@@ -11,7 +11,7 @@ priority = 250
 # native hook point (game/native_hooks.rs has none for a right click), and
 # native.rs calls the game's own internals (block entities, the block
 # behaviour library's placement, mobs' saved compounds, the hub's players), so
-# Carry Along builds on this commit only. Its other hooks are hook points
+# Carry Block builds on this commit only. Its other hooks are hook points
 # (NATIVE_HOOKS_API 1).
 [compatibility]
 horizon_revision = "142388e1c136e622652ec7505af15d8ad195e041"
@@ -19,13 +19,13 @@ horizon_revision = "142388e1c136e622652ec7505af15d8ad195e041"
 [[module]]
 id = "runtime"
 file = "crates/horizon-client/src/game.rs"
-name = "carryalong"
+name = "carryblock"
 source = "runtime.rs"
 
 [[module]]
 id = "native"
 file = "crates/horizon-client/src/game.rs"
-name = "carryalong_native"
+name = "carryblock_native"
 source = "native.rs"
 
 # Pinned: picking up and putting down replace a right click (a LAN guest's
@@ -63,7 +63,7 @@ bindings = [
   { name = "corners", ty = "&mut horizon_client::extras_hud::Corners", value = "&mut *corners" },
 ]
 
-# Hook point: `/carryalong`.
+# Hook point: `/carryblock`.
 [[injection]]
 id = "command"
 kind = "HEAD"

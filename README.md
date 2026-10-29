@@ -1,4 +1,4 @@
-# Carry Along
+# Carry Block
 
 A **native** Horizon mod (horizon-mixins source mixin): sneak and right click
 with an empty hand to pick up a chest, a furnace, a barrel... with everything
@@ -9,7 +9,7 @@ Inspired by Carry On (https://modrinth.com/mod/carry-on); not affiliated, no cod
 
 > **Native mods are not sandboxed.** Unlike `.hmod` (Wasm) mods, a native mod is
 > Rust source compiled into your own Horizon executable and runs with your user
-> rights. Read the source (it is small: `mixins/carryalong/`) before building.
+> rights. Read the source (it is small: `mixins/carryblock/`) before building.
 
 ## Behaviour
 
@@ -71,7 +71,7 @@ form, e.g. a chest item with its contents in it). A mob is let go at their
 feet. Respawning, the player carries nothing.
 
 **Disconnecting, quitting, crashing.** What a player carries is part of their
-own saved player data (a `carryalong:carried` compound in the player NBT), so
+own saved player data (a `carryblock:carried` compound in the player NBT), so
 it is saved, loaded and kept exactly like their inventory: a LAN guest who
 leaves still carries it when they come back; single player keeps carrying it
 after quitting and reopening the world.
@@ -124,16 +124,16 @@ move is done in one go on the game's own thread:
 
 | Command | Effect |
 |---|---|
-| `/carryalong` or `/carryalong status` | Says what you carry |
-| `/carryalong reload` | Re-read `config.json` (permission level 2) |
+| `/carryblock` or `/carryblock status` | Says what you carry |
+| `/carryblock reload` | Re-read `config.json` (permission level 2) |
 
 They run where the game runs commands: in single player, on a server whose
 players may use commands (a LAN guest without command rights gets "unknown
-command"; Carry Along itself needs no command).
+command"; Carry Block itself needs no command).
 
 ## Settings
 
-**Options > Mods** lists Carry Along with its **Settings** button. The row's own
+**Options > Mods** lists Carry Block with its **Settings** button. The row's own
 button turns the mod off (it then does nothing at all, the launcher's next
 build leaves it out; what players carry stays in their saved data until it is
 back) and on again. One button per setting; a click moves it to its next
@@ -168,14 +168,14 @@ The settings page writes, and the mod reads, one JSON file in the mod's
 settings folder, beside the game's `options.txt`:
 
 ```
-horizon-mods/.horizon-mod-data/carryalong/config.json
+horizon-mods/.horizon-mod-data/carryblock/config.json
 ```
 
 A missing file is written with the defaults. Edit it by hand for the deny
-lists, then click the Deny lists button or run `/carryalong reload`. Every key
+lists, then click the Deny lists button or run `/carryblock reload`. Every key
 is optional; unknown keys or out-of-range values stop picking up (putting down
 still works; the page shows the error and a reset, stderr says
-`Carry Along: no picking up: ...`) until the file is fixed. Defaults:
+`Carry Block: no picking up: ...`) until the file is fixed. Defaults:
 
 ```json
 {
@@ -201,7 +201,7 @@ Deny list entries: ids (`minecraft:spawner`, or `spawner`), `*` globs
 ## Compatibility
 
 Horizon's native mods can use **hook points** (`game/native_hooks.rs`,
-`NATIVE_HOOKS_API` 1), kept stable from release to release. Carry Along uses
+`NATIVE_HOOKS_API` 1), kept stable from release to release. Carry Block uses
 them for everything they cover:
 
 - `native_tick`: slowness, the HUD/action bar, releasing a dead carrier's
@@ -209,12 +209,12 @@ them for everything they cover:
   thread;
 - `native_hud`: the HUD box (placed with `Corners`, drawn with `native_fill`
   and `native_text`, hidden where `native_corner_shown` says F3 is);
-- `native_command`: `/carryalong`;
+- `native_command`: `/carryblock`;
 - `native_mods`, `native_settings`, `native_settings_click`: the row in
   Options > Mods and the settings page; `native_setting`/`native_set_setting`
   for the file, `native_on`/`native_window` for the on/off.
 
-There is no hook point for a right click, so Carry Along hooks one game
+There is no hook point for a right click, so Carry Block hooks one game
 function directly and is **pinned** to one Horizon commit:
 
 | Hook | Kind | Why it is not a hook point |
@@ -232,14 +232,14 @@ Pinned: Horizon `142388e1c136e622652ec7505af15d8ad195e041`, horizon-mixins
 `0d6b103c70633d8fd9443d8d0acd3aadaacedb06`, game 26.3: the same revisions as
 TreeFall 0.3.0 and Mason 0.2.0, so the three build into one game (checked:
 planned and applied together, 23 injections, 14 modules). Mason also hooks
-`Game::use_item`, for its wand (a wooden axe, creative only); Carry Along's
+`Game::use_item`, for its wand (a wooden axe, creative only); Carry Block's
 priority is 250, below Mason's 300, so a creative player holding the wand
 selects with it even while carrying. A pick up always needs an empty hand, so
 the two never compete for the same click.
 
 ## Build and try
 
-Carry Along is a source bundle; the launcher compiles it into a custom game:
+Carry Block is a source bundle; the launcher compiles it into a custom game:
 
 ```sh
 horizon-launcher native-build <this folder> --version v0.2.97 --trust-native-code
@@ -251,24 +251,24 @@ a folder holding several native mods (with TreeFall and Mason, for example).
 
 ## Development
 
-`mixins/carryalong/`:
+`mixins/carryblock/`:
 
 - `horizon-mixin.toml`: two support modules and seven HEAD hooks (above).
 - `runtime.rs`: every decision as pure code with unit tests: the settings and
   their page, deny lists, what may be picked up, the state a block is put down
   with, where a dead carrier's block goes, held-button detection, slowness,
   texts, commands. It is both this repository's Cargo library and the injected
-  `crate::game::carryalong` module.
-- `native.rs`: the adapter to the game (`crate::game::carryalong_native`).
+  `crate::game::carryblock` module.
+- `native.rs`: the adapter to the game (`crate::game::carryblock_native`).
 - `use.rs`, `tick.rs`, `hud.rs`, `command.rs`, `list.rs`, `settings.rs`,
   `click.rs`: the hook helpers.
 
 ```sh
 cargo test
 cargo fmt --check                                   # runtime.rs
-rustfmt --edition 2024 --check mixins/carryalong/*.rs
+rustfmt --edition 2024 --check mixins/carryblock/*.rs
 cargo clippy --all-targets -- -D warnings
-python tools/pack_hnmod.py   # dist/carryalong-<version>.hnmod
+python tools/pack_hnmod.py   # dist/carryblock-<version>.hnmod
 ```
 
 Not affiliated with Carry On or its authors; original code, written from the

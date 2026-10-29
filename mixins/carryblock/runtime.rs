@@ -1,10 +1,10 @@
-// Carry Along: sneak and right click with an empty hand to pick up a block with
+// Carry Block: sneak and right click with an empty hand to pick up a block with
 // everything in it (a chest, a furnace...) or a small mob, carry it around and
 // right click to put it down again.
 //
 // Original implementation for Horizon (a horizon-mixins native mod). This file
 // is both the standalone, unit-tested Cargo library and the injected
-// `crate::game::carryalong` module. It has no Horizon dependency: it decides
+// `crate::game::carryblock` module. It has no Horizon dependency: it decides
 // (what may be picked up, the state a block is put down with, the settings
 // page, the commands, the HUD text), and `native.rs` does what it decides in
 // the running game.
@@ -16,8 +16,8 @@ use std::collections::{BTreeMap, HashMap};
 pub type Uuid = [i32; 4];
 
 /// The mod's id: its row in Options > Mods and its settings folder
-/// (`horizon-mods/.horizon-mod-data/carryalong/`).
-pub const ID: &str = "carryalong";
+/// (`horizon-mods/.horizon-mod-data/carryblock/`).
+pub const ID: &str = "carryblock";
 pub const VERSION: &str = "0.1.0";
 pub const DESCRIPTION: &str = "Sneak and right click with an empty hand to pick up a chest, a \
 furnace or a small animal with everything in it; right click a block to put it down.";
@@ -25,12 +25,12 @@ furnace or a small animal with everything in it; right click a block to put it d
 /// writes, and where the deny lists are edited by hand.
 pub const CONFIG_FILE: &str = "config.json";
 /// The chat command (without its slash).
-pub const COMMAND: &str = "carryalong";
-pub const USAGE: &str = "Usage: /carryalong [status|reload]";
+pub const COMMAND: &str = "carryblock";
+pub const USAGE: &str = "Usage: /carryblock [status|reload]";
 
 /// The key of the player's saved compound that holds what they carry. It is
 /// saved and loaded with the player, exactly like their inventory.
-pub const CARRY_KEY: &str = "carryalong:carried";
+pub const CARRY_KEY: &str = "carryblock:carried";
 /// The keys of the carried compound.
 pub const KEY_FORMAT: &str = "format";
 pub const KEY_KIND: &str = "kind";
@@ -40,7 +40,7 @@ pub const KEY_STATE: &str = "state";
 pub const KEY_BLOCK_ENTITY: &str = "block_entity";
 /// A mob: its entity compound as the game saves it.
 pub const KEY_ENTITY: &str = "entity";
-/// What the HUD and `/carryalong` call it.
+/// What the HUD and `/carryblock` call it.
 pub const KEY_NAME: &str = "name";
 pub const KIND_BLOCK: &str = "block";
 pub const KIND_MOB: &str = "mob";
@@ -581,11 +581,11 @@ pub fn hud_lines(summary: &str) -> [String; 2] {
 pub fn action_bar_text(summary: &str) -> String {
     format!("Carrying {summary} - right click a block to put it down")
 }
-/// `/carryalong status`.
+/// `/carryblock status`.
 pub fn status_text(summary: Option<&str>) -> String {
     match summary {
-        Some(s) => format!("Carry Along {VERSION}: you are carrying {s}"),
-        None => format!("Carry Along {VERSION}: you are not carrying anything"),
+        Some(s) => format!("Carry Block {VERSION}: you are carrying {s}"),
+        None => format!("Carry Block {VERSION}: you are not carrying anything"),
     }
 }
 
@@ -652,7 +652,7 @@ pub fn is_command(line: &str) -> bool {
     let line = line.trim().trim_start_matches('/');
     line == COMMAND || line.starts_with(&format!("{COMMAND} "))
 }
-/// `/carryalong ...`: None when the line is not Carry Along's.
+/// `/carryblock ...`: None when the line is not Carry Block's.
 pub fn parse_command(line: &str) -> Option<Result<Command, &'static str>> {
     if !is_command(line) {
         return None;
@@ -674,7 +674,7 @@ pub fn parse_command(line: &str) -> Option<Result<Command, &'static str>> {
 /// broken (no new pick ups until it is fixed or reset).
 pub type Loaded = Result<Config, String>;
 
-/// A button of the settings page (Options > Mods > Carry Along > Settings).
+/// A button of the settings page (Options > Mods > Carry Block > Settings).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Setting {
     /// The file is broken: its error. A click reads it again.
@@ -1365,18 +1365,18 @@ mod tests {
 
     #[test]
     fn commands() {
-        assert_eq!(parse_command("carryalong"), Some(Ok(Command::Status)));
+        assert_eq!(parse_command("carryblock"), Some(Ok(Command::Status)));
         assert_eq!(
-            parse_command("/carryalong status"),
+            parse_command("/carryblock status"),
             Some(Ok(Command::Status))
         );
         assert_eq!(
-            parse_command("carryalong reload"),
+            parse_command("carryblock reload"),
             Some(Ok(Command::Reload))
         );
-        assert_eq!(parse_command("carryalong drop"), Some(Err(USAGE)));
-        assert_eq!(parse_command("carryalong reload now"), Some(Err(USAGE)));
-        assert_eq!(parse_command("carryalongx"), None);
+        assert_eq!(parse_command("carryblock drop"), Some(Err(USAGE)));
+        assert_eq!(parse_command("carryblock reload now"), Some(Err(USAGE)));
+        assert_eq!(parse_command("carryblockx"), None);
         assert_eq!(parse_command("give @s stone"), None);
     }
 

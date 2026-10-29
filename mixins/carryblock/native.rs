@@ -1,6 +1,6 @@
-// Carry Along's adapter to the game (Horizon 142388e1c136e622652ec7505af15d8ad195e041,
-// see horizon-mixin.toml). Injected as `crate::game::carryalong_native`; it
-// does what the game-independent rules in `crate::game::carryalong`
+// Carry Block's adapter to the game (Horizon 142388e1c136e622652ec7505af15d8ad195e041,
+// see horizon-mixin.toml). Injected as `crate::game::carryblock_native`; it
+// does what the game-independent rules in `crate::game::carryblock`
 // (runtime.rs) decide, in the game that simulates the world: in-frame single
 // player, single player's server thread (a LAN host's too) and the dedicated
 // server. A window joined to a server only draws its HUD box.
@@ -10,7 +10,7 @@
 // saved, loaded, swapped in for a LAN guest's turn and kept through a
 // disconnect exactly like their inventory. Nothing is ever an item while it
 // is carried.
-use super::carryalong::{
+use super::carryblock::{
     self as ca, BlockInfo, Command, Config, Effect, HudCorner, Loaded, MobInfo, Mode, State, Uuid,
     Verdict,
 };
@@ -87,7 +87,7 @@ fn read_config(game: &Game<'_>) -> Loaded {
 /// Puts `loaded` in effect, for every player at once.
 fn apply(loaded: Loaded) {
     if let Err(error) = &loaded {
-        eprintln!("Carry Along: no picking up: {error}");
+        eprintln!("Carry Block: no picking up: {error}");
     }
     shared(|s| s.config = Some(loaded));
 }
@@ -101,7 +101,7 @@ fn loaded(game: &Game<'_>) -> Loaded {
         s.config
             .get_or_insert_with(|| {
                 if let Err(error) = &read {
-                    eprintln!("Carry Along: no picking up: {error}");
+                    eprintln!("Carry Block: no picking up: {error}");
                 }
                 read
             })
@@ -386,11 +386,11 @@ impl Game<'_> {
         }
     }
 
-    /// `Game::use_item`'s HEAD: Some when the click was Carry Along's (the
+    /// `Game::use_item`'s HEAD: Some when the click was Carry Block's (the
     /// hand that acted, None for a click swallowed while carrying), None to
     /// let the game use it as usual. Runs for the player acting: a LAN
     /// guest in their turn, or in-frame single player's own player.
-    pub(super) fn carryalong_use(&mut self) -> Option<Option<Hand>> {
+    pub(super) fn carryblock_use(&mut self) -> Option<Option<Hand>> {
         if self.remote.is_some() || self.player.is_none() || self.spectator() || !on(self) {
             return None;
         }
@@ -610,7 +610,7 @@ impl Game<'_> {
             Some(ca::KIND_BLOCK) => self.ca_put_block(carried, hit),
             Some(ca::KIND_MOB) => self.ca_put_mob(carried, hit),
             _ => {
-                self.ca_tell("Carry Along doesn't know what you carry");
+                self.ca_tell("Carry Block doesn't know what you carry");
                 false
             }
         }
@@ -626,7 +626,7 @@ impl Game<'_> {
         }
         let registry = self.pack.assets.registry;
         let Some(text) = text_of(carried, ca::KEY_STATE) else {
-            self.ca_tell("Carry Along doesn't know what you carry");
+            self.ca_tell("Carry Block doesn't know what you carry");
             return false;
         };
         let (Some(carried_state), Ok(carried_id)) = (
@@ -695,7 +695,7 @@ impl Game<'_> {
     /// A carried mob let go on the block face `hit`, facing the player.
     fn ca_put_mob(&mut self, carried: &Tag, hit: &Hit) -> bool {
         let Some(entity) = carried.get(ca::KEY_ENTITY) else {
-            self.ca_tell("Carry Along doesn't know what you carry");
+            self.ca_tell("Carry Block doesn't know what you carry");
             return false;
         };
         let p = [
@@ -807,7 +807,7 @@ impl Game<'_> {
     /// and action bar hear what they carry, and what a dead carrier carried
     /// is left where they died. On the window, it notes Options > Mods'
     /// on/off for single player's server thread.
-    pub(super) fn carryalong_tick(&mut self) {
+    pub(super) fn carryblock_tick(&mut self) {
         if !on(self) || self.remote.is_some() {
             return;
         }
@@ -923,7 +923,7 @@ impl Game<'_> {
 
     /// `native_hud` (a hook point): the window's box saying what its player
     /// carries, as the game that simulates the world last said.
-    pub(super) fn carryalong_hud(&mut self, batch: &mut HudBatch, corners: &mut Corners) {
+    pub(super) fn carryblock_hud(&mut self, batch: &mut HudBatch, corners: &mut Corners) {
         if !on(self) {
             return;
         }
@@ -965,10 +965,10 @@ impl Game<'_> {
         self.native_text(batch, &second, [x + 3.0, y + 12.0], 0xAA_AAAA, true);
     }
 
-    /// `native_command` (a hook point): `/carryalong [status|reload]`;
-    /// true when it was Carry Along's. The game that simulates the world
+    /// `native_command` (a hook point): `/carryblock [status|reload]`;
+    /// true when it was Carry Block's. The game that simulates the world
     /// runs it, as the player who typed it.
-    pub(super) fn carryalong_command(&mut self, command: &str) -> bool {
+    pub(super) fn carryblock_command(&mut self, command: &str) -> bool {
         if self.remote.is_some() || !on(self) {
             return false;
         }
@@ -988,14 +988,14 @@ impl Game<'_> {
             Ok(Command::Reload) => {
                 if self.ui.registries.permission < 2 {
                     self.command_failure(Text::literal(
-                        "Carry Along reload requires permission level 2",
+                        "Carry Block reload requires permission level 2",
                     ));
                     return true;
                 }
                 match read_config(self) {
                     Ok(config) => {
                         apply(Ok(config));
-                        self.system_message(Text::literal("Carry Along configuration reloaded"));
+                        self.system_message(Text::literal("Carry Block configuration reloaded"));
                     }
                     Err(error) => self.command_failure(Text::literal(error)),
                 }
@@ -1005,13 +1005,13 @@ impl Game<'_> {
     }
 
     /// `native_settings` (a hook point): the settings page's buttons.
-    pub(super) fn carryalong_settings(&self) -> Vec<String> {
+    pub(super) fn carryblock_settings(&self) -> Vec<String> {
         ca::labels(&loaded(self))
     }
 
     /// `native_settings_click` (a hook point): change the setting, write
     /// `config.json` and put it in effect at once (or read the file again).
-    pub(super) fn carryalong_settings_click(&mut self, button: usize) {
+    pub(super) fn carryblock_settings_click(&mut self, button: usize) {
         match ca::click(&loaded(self), button) {
             Some(Effect::Save(config)) => {
                 self.native_set_setting(ca::ID, ca::CONFIG_FILE, &config.to_json());
