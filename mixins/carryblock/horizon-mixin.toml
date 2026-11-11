@@ -14,7 +14,7 @@ priority = 250
 # Carry Block builds on this commit only. Its other hooks are hook points
 # (NATIVE_HOOKS_API 1).
 [compatibility]
-horizon_revision = "aa27eca326db26e999d4e59d7899576016764b1e"
+horizon_revision = "fdc87aecdbd116bf1e08adcd062fcbaea8c2e2ca"
 
 [[module]]
 id = "runtime"
