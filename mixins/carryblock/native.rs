@@ -1,4 +1,4 @@
-// Carry Block's adapter to the game (Horizon 142388e1c136e622652ec7505af15d8ad195e041,
+// Carry Block's adapter to the game (Horizon fdc87aecdbd116bf1e08adcd062fcbaea8c2e2ca,
 // see horizon-mixin.toml). Injected as `crate::game::carryblock_native`; it
 // does what the game-independent rules in `crate::game::carryblock`
 // (runtime.rs) decide, in the game that simulates the world: in-frame single
@@ -264,7 +264,7 @@ impl Game<'_> {
             || self.player.as_ref().is_some_and(|p| p.shift_key_down)
     }
     fn ca_in_world(&self, p: [i32; 3]) -> bool {
-        p[1] >= self.dim.min_y() && p[1] <= self.dim.max_y() && self.world.loaded(p[0], p[2])
+        p[1] >= self.dim.shape().min_y && p[1] <= (self.dim.shape().max_y() - 1) && self.world.loaded(p[0], p[2])
     }
     /// A line in the acting player's action bar: a guest gets it at the
     /// end of their turn.
@@ -316,7 +316,7 @@ impl Game<'_> {
                     let halves = match menu.slots {
                         Slots::Block(k) => vec![k],
                         Slots::Double(a, b) => vec![a, b],
-                        Slots::Ender => Vec::new(),
+                        Slots::Ender | Slots::Native => Vec::new(),
                     };
                     for k in menu.pos.into_iter().chain(halves) {
                         view.open.insert((level, k));
@@ -569,7 +569,7 @@ impl Game<'_> {
             return None;
         }
         let mob = match guest {
-            Some(GuestUse::Entity(Hand::Main)) => true,
+            Some(GuestUse::Entity(Hand::Main, _)) => true,
             Some(GuestUse::OnBlock(Hand::Main)) => false,
             Some(_) => return None,
             None => self.entity_targeted(),
@@ -609,7 +609,7 @@ impl Game<'_> {
                 .assets
                 .registry
                 .state(state)
-                .map(|s| s.properties.clone())
+                .map(|s| s.properties.clone().into_iter().collect())
                 .unwrap_or_default(),
             block_entity: facts.block_entity || data.is_some(),
             hardness: facts.hardness,
@@ -693,7 +693,7 @@ impl Game<'_> {
     /// Picks up the mob aimed at, with all its data: true when it did. A
     /// player who may not build (`pick`) only hears so.
     fn ca_pick_mob(&mut self, config: &Config, pick: PickUp) -> bool {
-        let Some((index, distance)) = self.mob_hit() else {
+        let Some((index, distance, _)) = self.mob_hit() else {
             return false;
         };
         // In-frame, a block in front of the mob takes the click.
